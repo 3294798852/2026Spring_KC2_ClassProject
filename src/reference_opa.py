@@ -64,17 +64,25 @@ def _download_simopa_weight(dst_path: Path) -> None:
 
 def ensure_simopa_weight(weight_path: Path = SIMOPA_PATH) -> Path:
     if not weight_path.exists():
-        _download_simopa_weight(weight_path)
+        try:
+            _download_simopa_weight(weight_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"failed to prepare SimOPA weight at {weight_path}. "
+                "Please check network or manually place SimOPA.pth into models/."
+            ) from exc
     return weight_path
 
 
 class ReferenceOPAScorer:
     def __init__(
         self,
-        device: str = "cpu",
+        device: str = "auto",
         weight_path: Optional[Path] = None,
         score_temperature: float = 1.2,
     ) -> None:
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
         self.weight_path = ensure_simopa_weight(SIMOPA_PATH if weight_path is None else weight_path)
         self.model = SimOPAResNet().to(self.device).eval()

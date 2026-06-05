@@ -1,62 +1,49 @@
-import time
+import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
-import torch
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.config import COMPRESSED_PATH, STUDENT_PATH
-from src.compress import quantize_head
-from src.data_synth import generate_synthetic_sample
-from src.models import PlacementStudent
+from src.foreground import fit_foreground_to_background, resize_foreground
+from src.infer import rank_candidates
+from src.reference_opa import ensure_simopa_weight
 
 
-def _load(path):
-    obj = torch.load(path, map_location="cpu")
-    if isinstance(obj, dict) and obj.get("quantized_head", False):
-        model = quantize_head(PlacementStudent())
-        model.load_state_dict(obj["state_dict"])
-    elif isinstance(obj, dict) and "state_dict" in obj:
-        model = PlacementStudent()
-        model.load_state_dict(obj["state_dict"])
-    else:
-        raise ValueError(f"unsupported checkpoint format: {path}")
-    model.eval()
-    return model
+def evaluate_pair(bg_path: Path, fg_path: Path, candidate_count: int, top_k: int, scale: float) -> None:
+    bg = Image.open(bg_path).convert("RGB")
+    fg = Image.open(fg_path).convert("RGBA")
+    fg = fit_foreground_to_background(resize_foreground(fg, scale), bg)
 
-
-def _make_inputs(n=50):
-    xs = []
-    for _ in range(n):
-        x, _ = generate_synthetic_sample()
-        x = np.transpose(x, (2, 0, 1))
-        xs.append(torch.tensor(x, dtype=torch.float32).unsqueeze(0))
-    return xs
-
-
-def _bench(model, xs):
     t0 = time.time()
-    with torch.no_grad():
-        outs = [float(model(x).item()) for x in xs]
+    rows, _ = rank_candidates(bg, fg, top_k=top_k, candidate_count=candidate_count, scale_tag=scale)
     elapsed = (time.time() - t0) * 1000.0
-    return elapsed / len(xs), outs
+    scores = np.array([float(r["score"]) for r in rows], dtype=np.float32)
+    print(f"top-{top_k} latency_ms={elapsed:.1f}")
+    print(f"score min={scores.min():.4f} max={scores.max():.4f} gap={(scores.max()-scores.min()):.4f} std={scores.std():.4f}")
+    for i, r in enumerate(rows):
+        print(f"#{i+1} score={r['score']:.4f} level={r['level']} x={r['x']} y={r['y']} scale={r['scale']:.2f}")
 
 
 if __name__ == "__main__":
-    xs = _make_inputs(n=50)
-    raw = _load(STUDENT_PATH)
-    raw_ms, raw_out = _bench(raw, xs)
-    print(f"raw student avg latency: {raw_ms:.2f} ms")
+    parser = argparse.ArgumentParser(description="Evaluate SimOPA ranking quality on a real bg/fg pair.")
+    parser.add_argument("--bg", required=True, help="background image path")
+    parser.add_argument("--fg", required=True, help="foreground image path (RGBA preferred)")
+    parser.add_argument("--candidate-count", type=int, default=16)
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--scale", type=float, default=1.0)
+    args = parser.parse_args()
 
-    if COMPRESSED_PATH.exists():
-        cm = _load(COMPRESSED_PATH)
-        cm_ms, cm_out = _bench(cm, xs)
-        print(f"compressed student avg latency: {cm_ms:.2f} ms")
-        corr = np.corrcoef(np.array(raw_out), np.array(cm_out))[0, 1]
-        print(f"score correlation(raw vs compressed): {corr:.4f}")
-    else:
-        print("compressed model not found. run bootstrap_and_compress.py first.")
+    ensure_simopa_weight()
+    evaluate_pair(
+        bg_path=Path(args.bg),
+        fg_path=Path(args.fg),
+        candidate_count=max(6, int(args.candidate_count)),
+        top_k=max(1, int(args.top_k)),
+        scale=max(0.3, min(2.5, float(args.scale))),
+    )

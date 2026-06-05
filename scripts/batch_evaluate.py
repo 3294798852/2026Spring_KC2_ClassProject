@@ -1,0 +1,85 @@
+import argparse
+import csv
+import sys
+import time
+from pathlib import Path
+
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.foreground import fit_foreground_to_background, resize_foreground
+from src.infer import rank_candidates
+from src.reference_opa import ReferenceOPAScorer, ensure_simopa_weight
+
+
+def collect_pairs(bg_dir: Path, fg_dir: Path):
+    bg_map = {p.stem: p for p in bg_dir.iterdir() if p.is_file()}
+    fg_map = {p.stem: p for p in fg_dir.iterdir() if p.is_file()}
+    common = sorted(set(bg_map.keys()) & set(fg_map.keys()))
+    return [(k, bg_map[k], fg_map[k]) for k in common]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch evaluate SimOPA ranking and export CSV summary.")
+    parser.add_argument("--bg-dir", required=True)
+    parser.add_argument("--fg-dir", required=True)
+    parser.add_argument("--out-csv", default="batch_eval_results.csv")
+    parser.add_argument("--candidate-count", type=int, default=16)
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--scale", type=float, default=1.0)
+    args = parser.parse_args()
+
+    bg_dir = Path(args.bg_dir)
+    fg_dir = Path(args.fg_dir)
+    out_csv = Path(args.out_csv)
+
+    ensure_simopa_weight()
+    scorer = ReferenceOPAScorer(device="cpu")
+    pairs = collect_pairs(bg_dir, fg_dir)
+    if not pairs:
+        raise RuntimeError("no paired samples found. ensure bg/fg filenames share same stem.")
+
+    rows = []
+    for stem, bg_path, fg_path in pairs:
+        bg = Image.open(bg_path).convert("RGB")
+        fg = Image.open(fg_path).convert("RGBA")
+        fg = fit_foreground_to_background(resize_foreground(fg, args.scale), bg)
+        t0 = time.time()
+        ranked, _ = rank_candidates(
+            bg,
+            fg,
+            top_k=max(1, args.top_k),
+            candidate_count=max(6, args.candidate_count),
+            scale_tag=args.scale,
+            scorer=scorer,
+        )
+        latency_ms = (time.time() - t0) * 1000.0
+        scores = [float(r["score"]) for r in ranked]
+        rows.append(
+            {
+                "sample": stem,
+                "latency_ms": f"{latency_ms:.2f}",
+                "top1_score": f"{scores[0]:.4f}",
+                "topk_min": f"{min(scores):.4f}",
+                "topk_max": f"{max(scores):.4f}",
+                "topk_gap": f"{(max(scores) - min(scores)):.4f}",
+                "top1_x": int(ranked[0]["x"]),
+                "top1_y": int(ranked[0]["y"]),
+                "top1_scale": f"{float(ranked[0]['scale']):.2f}",
+            }
+        )
+        print(f"[{stem}] top1={scores[0]:.4f} gap={max(scores)-min(scores):.4f} latency={latency_ms:.1f}ms")
+
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"done. {len(rows)} samples saved to {out_csv}")
+
+
+if __name__ == "__main__":
+    main()

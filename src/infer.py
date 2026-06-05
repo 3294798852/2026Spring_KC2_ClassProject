@@ -1,21 +1,17 @@
 from dataclasses import asdict
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
 from PIL import Image
 
 from src.compositor import Candidate, compose_rgba, generate_candidates, pil_to_rgb_np, pil_to_rgba_np
-from src.compress import quantize_head
-from src.config import COMPRESSED_PATH, STUDENT_PATH
-from src.models import PlacementStudent, classify_score
 from src.reference_opa import ReferenceOPAScorer
+from src.scoring import classify_score
 
 
-def _to_tensor(comp: np.ndarray, mask: np.ndarray) -> torch.Tensor:
-    inp = np.concatenate([comp, mask], axis=-1)
-    inp = np.transpose(inp, (2, 0, 1))
-    return torch.tensor(inp, dtype=torch.float32).unsqueeze(0)
+def _chunked(items: List[Tuple[int, int]], chunk_size: int) -> List[List[Tuple[int, int]]]:
+    chunk_size = max(1, int(chunk_size))
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
 def _clip_position(x: int, y: int, max_x: int, max_y: int) -> Tuple[int, int]:
@@ -69,39 +65,13 @@ def _select_diverse_top(rows: List[Candidate], top_k: int, min_dist: float) -> L
     return selected[:top_k]
 
 
-def load_legacy_infer_model(prefer_compressed: bool = True) -> torch.nn.Module:
-    if prefer_compressed and COMPRESSED_PATH.exists():
-        obj = torch.load(COMPRESSED_PATH, map_location="cpu")
-        if isinstance(obj, dict) and obj.get("quantized_head", False):
-            model = quantize_head(PlacementStudent())
-            model.load_state_dict(obj["state_dict"])
-            model.eval()
-            return model
-        if isinstance(obj, dict) and "state_dict" in obj:
-            model = PlacementStudent()
-            model.load_state_dict(obj["state_dict"])
-            model.eval()
-            return model
-
-    if not STUDENT_PATH.exists():
-        raise FileNotFoundError(
-            f"missing model weights: {STUDENT_PATH}. please run `python scripts/bootstrap_and_compress.py` first."
-        )
-
-    model = PlacementStudent()
-    ckpt = torch.load(STUDENT_PATH, map_location="cpu")
-    model.load_state_dict(ckpt["state_dict"])
-    model.eval()
-    return model
-
-
 def rank_candidates(
     background: Image.Image,
     foreground: Image.Image,
     top_k: int = 5,
     candidate_count: int = 12,
-    prefer_compressed: bool = False,
-    model_backend: Literal["simopa", "legacy"] = "simopa",
+    scale_tag: float = 1.0,
+    scorer: ReferenceOPAScorer | None = None,
 ) -> Tuple[List[Dict], List[Image.Image]]:
     bg = pil_to_rgb_np(background)
     fg = pil_to_rgba_np(foreground)
@@ -111,29 +81,22 @@ def rank_candidates(
     max_y = max(0, bg_h - fg_h)
 
     score_cache: Dict[Tuple[int, int], float] = {}
-    simopa_scorer = ReferenceOPAScorer(device="cpu") if model_backend == "simopa" else None
-    legacy_model = load_legacy_infer_model(prefer_compressed=prefer_compressed) if model_backend != "simopa" else None
+    simopa_scorer = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
 
-    def score_positions(positions: List[Tuple[int, int]]) -> List[float]:
+    def score_positions(positions: List[Tuple[int, int]], chunk_size: int = 6) -> List[float]:
         clipped = [_clip_position(x, y, max_x, max_y) for x, y in positions]
         pending = [p for p in clipped if p not in score_cache]
         if pending:
-            composites: List[np.ndarray] = []
-            masks: List[np.ndarray] = []
-            for x, y in pending:
-                comp, mask = compose_rgba(bg, fg, x, y)
-                composites.append(comp)
-                masks.append(mask)
-            if simopa_scorer is not None:
+            for chunk in _chunked(pending, chunk_size):
+                composites: List[np.ndarray] = []
+                masks: List[np.ndarray] = []
+                for x, y in chunk:
+                    comp, mask = compose_rgba(bg, fg, x, y)
+                    composites.append(comp)
+                    masks.append(mask)
                 new_scores = simopa_scorer.score_batch(composites, masks)
-            else:
-                assert legacy_model is not None
-                with torch.no_grad():
-                    new_scores = [
-                        float(legacy_model(_to_tensor(comp, mask)).item()) for comp, mask in zip(composites, masks)
-                    ]
-            for pos, score in zip(pending, new_scores):
-                score_cache[pos] = float(score)
+                for pos, score in zip(chunk, new_scores):
+                    score_cache[pos] = float(score)
         return [score_cache[p] for p in clipped]
 
     # Stage 1: broad search.
@@ -191,4 +154,66 @@ def rank_candidates(
     for r in top_rows:
         comp, _ = compose_rgba(bg, fg, r.x, r.y)
         top_rendered.append(Image.fromarray((comp * 255).astype(np.uint8)))
+    # Add scale metadata for multi-scale merge.
+    for item in out:
+        item["scale"] = float(scale_tag)
     return out, top_rendered
+
+
+def score_single_position(
+    background: Image.Image,
+    foreground: Image.Image,
+    x: int,
+    y: int,
+    scorer: ReferenceOPAScorer | None = None,
+) -> Dict:
+    bg = pil_to_rgb_np(background)
+    fg = pil_to_rgba_np(foreground)
+    bg_h, bg_w, _ = bg.shape
+    fg_h, fg_w, _ = fg.shape
+    max_x = max(0, bg_w - fg_w)
+    max_y = max(0, bg_h - fg_h)
+    x, y = _clip_position(int(x), int(y), max_x, max_y)
+
+    comp, mask = compose_rgba(bg, fg, x, y)
+    sc = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
+    score = float(sc.score_batch([comp], [mask])[0])
+    return {
+        "x": x,
+        "y": y,
+        "score": score,
+        "level": classify_score(score),
+        "image": Image.fromarray((comp * 255).astype(np.uint8)),
+    }
+
+
+def score_heatmap(
+    background: Image.Image,
+    foreground: Image.Image,
+    grid_size: int = 14,
+    scorer: ReferenceOPAScorer | None = None,
+) -> np.ndarray:
+    bg = pil_to_rgb_np(background)
+    fg = pil_to_rgba_np(foreground)
+    bg_h, bg_w, _ = bg.shape
+    fg_h, fg_w, _ = fg.shape
+    max_x = max(0, bg_w - fg_w)
+    max_y = max(0, bg_h - fg_h)
+    grid_size = max(6, int(grid_size))
+
+    xs = np.linspace(0, max_x, num=grid_size, dtype=int)
+    ys = np.linspace(0, max_y, num=grid_size, dtype=int)
+    pos = [(int(x), int(y)) for y in ys for x in xs]
+
+    sc = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
+    scores: List[float] = []
+    for chunk in _chunked(pos, chunk_size=4):
+        composites: List[np.ndarray] = []
+        masks: List[np.ndarray] = []
+        for x, y in chunk:
+            comp, mask = compose_rgba(bg, fg, x, y)
+            composites.append(comp)
+            masks.append(mask)
+        scores.extend(sc.score_batch(composites, masks))
+    arr = np.array(scores, dtype=np.float32).reshape(grid_size, grid_size)
+    return arr

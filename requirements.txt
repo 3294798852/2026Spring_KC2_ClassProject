@@ -5,3 +5,6 @@ numpy>=1.26
 pillow>=10.0
 huggingface_hub>=0.23
 modelscope>=1.16
+rembg>=2.0
+onnxruntime>=1.18
+streamlit-drawable-canvas>=0.9
