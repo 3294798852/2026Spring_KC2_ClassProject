@@ -217,3 +217,113 @@ def score_heatmap(
         scores.extend(sc.score_batch(composites, masks))
     arr = np.array(scores, dtype=np.float32).reshape(grid_size, grid_size)
     return arr
+
+
+def rank_candidates_heatmap_guided(
+    background: Image.Image,
+    foreground: Image.Image,
+    top_k: int = 5,
+    candidate_count: int = 48,
+    heatmap_grid: int = 18,
+    scale_tag: float = 1.0,
+    scorer: ReferenceOPAScorer | None = None,
+) -> Tuple[List[Dict], List[Image.Image], np.ndarray]:
+    """
+    Unified pipeline:
+    1) compute heatmap samples first;
+    2) use high-score heatmap points as search seeds;
+    3) add supplemental seeds when budget is large;
+    4) return ranking + rendered top-k + heatmap.
+    """
+    bg = pil_to_rgb_np(background)
+    fg = pil_to_rgba_np(foreground)
+    bg_h, bg_w, _ = bg.shape
+    fg_h, fg_w, _ = fg.shape
+    max_x = max(0, bg_w - fg_w)
+    max_y = max(0, bg_h - fg_h)
+    heatmap_grid = max(6, int(heatmap_grid))
+    candidate_count = max(12, int(candidate_count))
+
+    score_cache: Dict[Tuple[int, int], float] = {}
+    simopa_scorer = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
+
+    def score_positions(positions: List[Tuple[int, int]], chunk_size: int = 6) -> List[float]:
+        clipped = [_clip_position(x, y, max_x, max_y) for x, y in positions]
+        pending = [p for p in clipped if p not in score_cache]
+        if pending:
+            for chunk in _chunked(pending, chunk_size):
+                composites: List[np.ndarray] = []
+                masks: List[np.ndarray] = []
+                for x, y in chunk:
+                    comp, mask = compose_rgba(bg, fg, x, y)
+                    composites.append(comp)
+                    masks.append(mask)
+                new_scores = simopa_scorer.score_batch(composites, masks)
+                for pos, score in zip(chunk, new_scores):
+                    score_cache[pos] = float(score)
+        return [score_cache[p] for p in clipped]
+
+    xs = np.linspace(0, max_x, num=heatmap_grid, dtype=int)
+    ys = np.linspace(0, max_y, num=heatmap_grid, dtype=int)
+    grid_positions = [(int(x), int(y)) for y in ys for x in xs]
+    grid_scores = score_positions(grid_positions, chunk_size=6)
+    heatmap = np.array(grid_scores, dtype=np.float32).reshape(heatmap_grid, heatmap_grid)
+    ranked_grid = sorted(zip(grid_positions, grid_scores), key=lambda t: t[1], reverse=True)
+
+    elite_count = min(len(ranked_grid), max(8, candidate_count // 2))
+    elite_positions = [ranked_grid[i][0] for i in range(elite_count)]
+    step_x = max(2, max_x // max(1, heatmap_grid - 1))
+    step_y = max(2, max_y // max(1, heatmap_grid - 1))
+    init_step = max(4, int(max(step_x, step_y) * 0.8))
+
+    refined_positions: List[Tuple[int, int]] = []
+    for start in elite_positions:
+        cur_x, cur_y = start
+        cur_score = score_positions([(cur_x, cur_y)])[0]
+        step = init_step
+        while step >= 2:
+            neighbors = [
+                (cur_x + step, cur_y),
+                (cur_x - step, cur_y),
+                (cur_x, cur_y + step),
+                (cur_x, cur_y - step),
+                (cur_x + step, cur_y + step),
+                (cur_x + step, cur_y - step),
+                (cur_x - step, cur_y + step),
+                (cur_x - step, cur_y - step),
+            ]
+            neighbors = [_clip_position(x, y, max_x, max_y) for x, y in neighbors]
+            neigh_scores = score_positions(neighbors)
+            best_idx = int(np.argmax(neigh_scores))
+            if neigh_scores[best_idx] > cur_score + 1e-6:
+                cur_x, cur_y = neighbors[best_idx]
+                cur_score = neigh_scores[best_idx]
+            else:
+                step //= 2
+        refined_positions.append((cur_x, cur_y))
+
+    all_positions = grid_positions + refined_positions
+    if len(all_positions) < candidate_count:
+        all_positions.extend(_generate_seed_positions(bg_w, bg_h, fg_w, fg_h, candidate_count))
+    all_scores = score_positions(all_positions, chunk_size=6)
+
+    rows: List[Candidate] = []
+    seen = set()
+    for (x, y), score in sorted(zip(all_positions, all_scores), key=lambda t: t[1], reverse=True):
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        rows.append(Candidate(x=x, y=y, score=float(score), level=classify_score(float(score))))
+
+    rows = rows[: max(candidate_count * 2, 20)]
+    min_dist = max(10.0, min(fg_w, fg_h) * 0.35)
+    top_rows = _select_diverse_top(rows, top_k=top_k, min_dist=min_dist)
+    out = [asdict(r) for r in top_rows]
+
+    top_rendered: List[Image.Image] = []
+    for r in top_rows:
+        comp, _ = compose_rgba(bg, fg, r.x, r.y)
+        top_rendered.append(Image.fromarray((comp * 255).astype(np.uint8)))
+    for item in out:
+        item["scale"] = float(scale_tag)
+    return out, top_rendered, heatmap
