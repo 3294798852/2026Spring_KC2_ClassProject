@@ -6,9 +6,13 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
+import importlib
+import hashlib
+import base64
 
 import numpy as np
 import streamlit as st
+import torch
 from PIL import Image, ImageDraw, ImageFilter
 
 from src.foreground import (
@@ -19,11 +23,49 @@ from src.foreground import (
     resize_foreground,
 )
 from src.image_preprocess import resize_by_long_edge
-from src.infer import rank_candidates, score_heatmap, score_single_position
-from src.config import STUDENT_CNN_PATH
-from src.opa import BACKENDS, REFERENCE_BACKEND, STUDENT_BACKEND, create_opa_scorer
-from src.reference_opa import ensure_simopa_weight
+from src.infer import rank_candidates_heatmap_guided, score_single_position
+from src.reference_opa import ReferenceOPAScorer, ensure_simopa_weight
 from src.user_feedback import analyze_candidate, spread_summary
+
+
+def _patch_streamlit_canvas_compat() -> None:
+    """
+    streamlit-drawable-canvas may depend on `streamlit.elements.image.image_to_url`,
+    which is removed in newer streamlit versions. Patch it from image_utils.
+    """
+    try:
+        st_image_mod = importlib.import_module("streamlit.elements.image")
+        image_utils_mod = importlib.import_module("streamlit.elements.lib.image_utils")
+        if not hasattr(image_utils_mod, "image_to_url"):
+            return
+        target = getattr(st_image_mod, "image_to_url", None)
+        # If legacy API already exists with old signature, keep it.
+        if callable(target):
+            try:
+                import inspect
+
+                param_count = len(inspect.signature(target).parameters)
+                if param_count == 6:
+                    return
+            except Exception:
+                pass
+
+        # Build old-signature shim expected by streamlit-drawable-canvas.
+        from types import SimpleNamespace
+
+        new_impl = getattr(image_utils_mod, "image_to_url")
+
+        def _legacy_image_to_url(image, width, clamp, channels, output_format, image_id):
+            layout = SimpleNamespace(width=width)
+            return new_impl(image, layout, clamp, channels, output_format, image_id)
+
+        setattr(st_image_mod, "image_to_url", _legacy_image_to_url)
+    except Exception:
+        # Keep silent; fallback logic will handle canvas degradation.
+        return
+
+
+_patch_streamlit_canvas_compat()
 
 try:
     from streamlit_drawable_canvas import st_canvas  # type: ignore[reportMissingImports]
@@ -35,12 +77,9 @@ except Exception:
 
 st.set_page_config(page_title="方向A-物体放置助手", layout="wide")
 st.title("方向 A：智能物体放置与质量评分（本地推理）")
-st.caption("评分模型可在侧边栏快速切换：Student CNN 或原始 SimOPA。")
-
-
-@st.cache_resource(show_spinner=False)
-def _load_scorer(model_backend: str):
-    return create_opa_scorer(model_backend, device="auto")
+st.caption("主线模型：BCMI/libcom 的 SimOPA（已移除 legacy 路径）。")
+expected_device = "cuda" if torch.cuda.is_available() else "cpu"
+st.caption(f"预估推理设备：`{expected_device}`（启动推理前显示）")
 
 
 def _image_to_png_bytes(img: Image.Image) -> bytes:
@@ -131,37 +170,46 @@ def _odd(v: int) -> int:
 def _get_canvas_mask(
     canvas_image_data: np.ndarray,
     target_size: tuple[int, int],
-    base_keep_mask: Optional[np.ndarray] = None,
-    expand_px: int = 0,
-    shrink_px: int = 0,
-    feather_px: int = 1,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract user painted keep-region mask from drawable canvas image_data.
-    We use bright-green strokes as keep-mark, bright-red strokes as erase-mark.
+    Extract keep/erase marks from canvas image.
+    Robust to anti-aliasing and alpha blending.
     """
-    if base_keep_mask is None:
-        keep_mask = np.zeros((target_size[1], target_size[0]), dtype=np.float32)
-    else:
-        keep_mask = np.clip(base_keep_mask.astype(np.float32), 0.0, 1.0)
-        if keep_mask.shape != (target_size[1], target_size[0]):
-            keep_mask = np.asarray(
-                Image.fromarray((keep_mask * 255).astype(np.uint8), mode="L").resize(
-                    target_size, Image.Resampling.BILINEAR
-                ),
-                dtype=np.float32,
-            ) / 255.0
-
+    empty = np.zeros((target_size[1], target_size[0]), dtype=np.float32)
     if canvas_image_data is None:
-        return keep_mask
+        return empty, empty
     arr = np.asarray(canvas_image_data, dtype=np.uint8)
     if arr.ndim != 3 or arr.shape[2] < 3:
-        return keep_mask
+        return empty, empty
     r = arr[..., 0].astype(np.int16)
     g = arr[..., 1].astype(np.int16)
     b = arr[..., 2].astype(np.int16)
-    keep_mark = (g > 180) & (r < 120) & (b < 120)
-    erase_mark = (r > 180) & (g < 120) & (b < 120)
+    a = arr[..., 3].astype(np.int16) if arr.shape[2] > 3 else np.full_like(r, 255)
+
+    rgb = arr[..., :3].astype(np.float32) / 255.0
+    r_f = rgb[..., 0]
+    g_f = rgb[..., 1]
+    b_f = rgb[..., 2]
+    cmax = np.max(rgb, axis=-1)
+    cmin = np.min(rgb, axis=-1)
+    delta = cmax - cmin
+    sat = np.where(cmax > 1e-6, delta / (cmax + 1e-6), 0.0)
+
+    # HSV hue in degrees [0, 360)
+    hue = np.zeros_like(cmax, dtype=np.float32)
+    nonzero = delta > 1e-6
+    idx = nonzero & (cmax == r_f)
+    hue[idx] = ((g_f[idx] - b_f[idx]) / delta[idx]) % 6.0
+    idx = nonzero & (cmax == g_f)
+    hue[idx] = ((b_f[idx] - r_f[idx]) / delta[idx]) + 2.0
+    idx = nonzero & (cmax == b_f)
+    hue[idx] = ((r_f[idx] - g_f[idx]) / delta[idx]) + 4.0
+    hue = (hue * 60.0) % 360.0
+
+    alpha_ok = a > 10
+    sat_ok = sat > 0.20
+    keep_mark = alpha_ok & sat_ok & (hue >= 70.0) & (hue <= 170.0)   # green-ish
+    erase_mark = alpha_ok & sat_ok & ((hue <= 20.0) | (hue >= 340.0))  # red-ish
 
     keep_img = Image.fromarray((keep_mark.astype(np.uint8) * 255), mode="L").resize(
         target_size, Image.Resampling.BILINEAR
@@ -171,11 +219,50 @@ def _get_canvas_mask(
     )
     keep_delta = np.asarray(keep_img, dtype=np.float32) / 255.0
     erase_delta = np.asarray(erase_img, dtype=np.float32) / 255.0
+    return keep_delta, erase_delta
 
-    keep_mask = np.maximum(keep_mask, keep_delta)
-    keep_mask = keep_mask * (1.0 - erase_delta)
 
-    mask_img = Image.fromarray((np.clip(keep_mask, 0.0, 1.0) * 255).astype(np.uint8), mode="L")
+def _compose_manual_keep_mask(
+    base_keep_mask: Optional[np.ndarray],
+    keep_delta: np.ndarray,
+    erase_delta: np.ndarray,
+    combine_mode: str,
+    expand_px: int = 0,
+    shrink_px: int = 0,
+    feather_px: int = 1,
+) -> np.ndarray:
+    if base_keep_mask is None:
+        base = np.zeros_like(keep_delta, dtype=np.float32)
+    else:
+        base = np.clip(base_keep_mask.astype(np.float32), 0.0, 1.0)
+        if base.shape != keep_delta.shape:
+            base = np.asarray(
+                Image.fromarray((base * 255).astype(np.uint8), mode="L").resize(
+                    (keep_delta.shape[1], keep_delta.shape[0]), Image.Resampling.BILINEAR
+                ),
+                dtype=np.float32,
+            ) / 255.0
+
+    keep_bin = (keep_delta > 0.10).astype(np.float32)
+    base_bin = (base > 0.10).astype(np.float32)
+    if combine_mode == "并集":
+        keep_mask = np.maximum(base_bin, keep_bin)
+    elif combine_mode == "交集":
+        # If no manual keep marks, keep base unchanged (avoid accidental empty output).
+        if keep_bin.sum() < 1:
+            keep_mask = base_bin.copy()
+        else:
+            keep_mask = base_bin * keep_bin
+    elif combine_mode == "仅手工":
+        keep_mask = keep_bin
+    else:  # 仅智能
+        keep_mask = base_bin
+
+    erase_bin = (erase_delta > 0.10).astype(np.float32)
+    keep_mask = keep_mask * (1.0 - erase_bin)
+    keep_mask = np.clip(keep_mask, 0.0, 1.0)
+
+    mask_img = Image.fromarray((keep_mask * 255).astype(np.uint8), mode="L")
     if expand_px > 0:
         mask_img = mask_img.filter(ImageFilter.MaxFilter(size=_odd(expand_px)))
     if shrink_px > 0:
@@ -183,6 +270,14 @@ def _get_canvas_mask(
     if feather_px > 1:
         mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=float(feather_px)))
     return np.asarray(mask_img, dtype=np.float32) / 255.0
+
+
+def _uploaded_file_id(uploaded_file) -> str:
+    if uploaded_file is None:
+        return "none"
+    payload = uploaded_file.getvalue()
+    digest = hashlib.md5(payload).hexdigest()[:10]
+    return f"{uploaded_file.name}:{len(payload)}:{digest}"
 
 
 def _safe_canvas(
@@ -210,14 +305,14 @@ def _safe_canvas(
             drawing_mode=draw_mode,
             key=canvas_key,
         ), False
-    except AttributeError as exc:
+    except Exception as exc:
         # streamlit_drawable_canvas older versions may call removed internals
         # (e.g. streamlit.elements.image.image_to_url). Fallback still supports
         # manual mask drawing and keeps the feature usable.
         st.warning(f"画布背景兼容失败，已切换兼容模式：{exc}")
         c_left, c_right = st.columns(2)
         with c_left:
-            st.image(fg_show, caption="参考前景图（在右侧画布按同位置涂抹）", use_container_width=True)
+            st.image(fg_show, caption="参考前景图（在右侧画布按同位置涂抹）", width="stretch")
         with c_right:
             canvas = st_canvas(
                 fill_color=fill_color,
@@ -232,18 +327,117 @@ def _safe_canvas(
             )
         return canvas, True
 
+
+def _get_cached_auto_seed_rgba(
+    fg_preview: Image.Image,
+    fg_source_id: str,
+    cutout_target: str,
+    show_spinner: bool = False,
+) -> Image.Image | None:
+    seed_cache_key = f"{fg_source_id}|{cutout_target}"
+    if st.session_state.get("manual_auto_seed_cache_key") == seed_cache_key:
+        return st.session_state.get("manual_auto_seed_rgba")
+    try:
+        if show_spinner:
+            with st.spinner("计算智能抠图预览..."):
+                auto_seed_rgba, _ = remove_background(fg_preview, target=cutout_target)
+        else:
+            auto_seed_rgba, _ = remove_background(fg_preview, target=cutout_target)
+        st.session_state["manual_auto_seed_rgba"] = auto_seed_rgba
+        st.session_state["manual_auto_seed_cache_key"] = seed_cache_key
+        return auto_seed_rgba
+    except Exception:
+        st.session_state["manual_auto_seed_rgba"] = None
+        st.session_state["manual_auto_seed_cache_key"] = seed_cache_key
+        return None
+
+
+def _show_small_rgba_preview(image: Image.Image, caption: str, max_w: int = 420) -> None:
+    show_w = min(max_w, image.size[0])
+    ratio = show_w / max(1, image.size[0])
+    show_h = max(1, int(image.size[1] * ratio))
+    preview = image.resize((show_w, show_h), Image.Resampling.BILINEAR)
+    col_l, col_r = st.columns([1, 2])
+    with col_l:
+        st.image(preview, caption=caption, width="stretch")
+    with col_r:
+        st.caption(f"预览尺寸：{show_w}x{show_h}")
+
+
+def _pil_rgba_to_data_url(image: Image.Image, max_side: int = 1200) -> str:
+    img = image.convert("RGBA")
+    w, h = img.size
+    side = max(w, h)
+    if side > max_side:
+        scale = max_side / float(side)
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.BILINEAR)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def _extract_image_xy_from_canvas(
+    json_data: dict | None,
+    default_x: int,
+    default_y: int,
+    max_x: int,
+    max_y: int,
+) -> tuple[int, int]:
+    x = int(default_x)
+    y = int(default_y)
+    try:
+        if not json_data or "objects" not in json_data or len(json_data["objects"]) == 0:
+            return x, y
+        obj = json_data["objects"][0]
+        x = int(round(float(obj.get("left", x))))
+        y = int(round(float(obj.get("top", y))))
+    except Exception:
+        pass
+    x = max(0, min(max_x, x))
+    y = max(0, min(max_y, y))
+    return x, y
+
+
+def _extract_transform_from_canvas(
+    json_data: dict | None,
+    default_x: int,
+    default_y: int,
+    default_scale: float,
+    fg_w: int,
+    fg_h: int,
+    max_x: int,
+    max_y: int,
+) -> tuple[int, int, float]:
+    x = int(default_x)
+    y = int(default_y)
+    scale = float(default_scale)
+    try:
+        if not json_data or "objects" not in json_data or len(json_data["objects"]) == 0:
+            return x, y, scale
+        obj = json_data["objects"][0]
+        left = float(obj.get("left", x))
+        top = float(obj.get("top", y))
+        width = float(obj.get("width", fg_w))
+        height = float(obj.get("height", fg_h))
+        scale_x = float(obj.get("scaleX", 1.0))
+        scale_y = float(obj.get("scaleY", 1.0))
+        box_w = max(8.0, width * scale_x)
+        box_h = max(8.0, height * scale_y)
+        # map transformed box back to uniform fg scale
+        s_w = box_w / max(1.0, float(fg_w))
+        s_h = box_h / max(1.0, float(fg_h))
+        scale = max(0.3, min(2.5, (s_w + s_h) * 0.5))
+        x = int(round(left))
+        y = int(round(top))
+        x = max(0, min(max_x, x))
+        y = max(0, min(max_y, y))
+    except Exception:
+        pass
+    return x, y, scale
+
 with st.sidebar:
     st.header("模型与权重")
-    model_backend = st.selectbox(
-        "评分模型",
-        options=BACKENDS,
-        index=0,
-        help="Student CNN 使用训练后的 models/student_cnn.pth；原始 SimOPA 使用 models/SimOPA.pth。",
-    )
-    if STUDENT_CNN_PATH.exists():
-        st.success(f"Student CNN 权重已就绪: {STUDENT_CNN_PATH}")
-    else:
-        st.warning("未找到 Student CNN 权重。请先运行 `scripts/train_student_cnn.py` 训练。")
     if st.button("下载/检查 SimOPA 参考权重"):
         with st.spinner("准备 SimOPA 权重中..."):
             try:
@@ -254,10 +448,7 @@ with st.sidebar:
                     "权重下载失败。请检查网络后重试，或手动将 `SimOPA.pth` 放到 `models/` 目录。"
                 )
                 st.caption(str(exc))
-    if model_backend == STUDENT_BACKEND:
-        st.info("当前网页推理会加载 `models/student_cnn.pth`。")
-    elif model_backend == REFERENCE_BACKEND:
-        st.info("当前网页推理会加载 `models/SimOPA.pth`。")
+    st.info("本版本仅保留 SimOPA 评分主线。首次建议先点击一次“下载/检查权重”。")
 
 bg_file = st.file_uploader(
     "上传背景图 (支持 jpg/jpeg/png/webp/bmp)",
@@ -354,6 +545,8 @@ if cutout_mode == "手工抠图(画笔)":
     if not HAS_DRAWABLE_CANVAS:
         st.warning("未安装 `streamlit-drawable-canvas`，请执行 `pip install streamlit-drawable-canvas` 后重启。")
     elif fg_file is not None:
+        fg_source_id = _uploaded_file_id(fg_file)
+        st.session_state["manual_fg_source_id"] = fg_source_id
         fg_preview = Image.open(fg_file).convert("RGB")
         max_show_w = 700
         show_scale = min(1.0, max_show_w / max(1, fg_preview.size[0]))
@@ -366,6 +559,29 @@ if cutout_mode == "手工抠图(画笔)":
             manual_brush_mode = st.selectbox("画笔模式", options=["保留(绿色)", "擦除(红色)"], index=0)
         with c3:
             draw_mode = st.selectbox("绘制方式", options=["freedraw", "polygon", "line"], index=0)
+
+        combine_mode = st.selectbox(
+            "手工与智能掩码融合",
+            options=["并集", "交集", "仅手工", "仅智能"],
+            index=0,
+            help="并集=保留两者任一区域；交集=只保留两者共同区域；其余为单独使用。",
+        )
+
+        auto_seed_rgba = None
+        if manual_seed_mode == "智能抠图结果":
+            auto_seed_rgba = _get_cached_auto_seed_rgba(
+                fg_preview=fg_preview,
+                fg_source_id=fg_source_id,
+                cutout_target=cutout_target,
+                show_spinner=True,
+            )
+            if auto_seed_rgba is not None:
+                _show_small_rgba_preview(
+                    auto_seed_rgba,
+                    caption="智能抠图初始化结果（供手工精修参考）",
+                )
+            else:
+                st.warning("智能抠图初始化结果暂不可用，将以空白掩码初始化。")
 
         b1, b2, b3 = st.columns(3)
         with b1:
@@ -382,6 +598,8 @@ if cutout_mode == "手工抠图(画笔)":
             st.session_state["manual_canvas_uid"] = f"canvas_{time.time_ns()}"
             st.session_state["manual_canvas_data"] = None
             st.session_state["manual_canvas_compat_mode"] = False
+            st.session_state["manual_applied_rgba"] = None
+            st.session_state["manual_applied_info"] = None
             st.rerun()
 
         stroke_color = "#00FF00" if manual_brush_mode.startswith("保留") else "#FF0000"
@@ -402,41 +620,97 @@ if cutout_mode == "手工抠图(画笔)":
         st.session_state["manual_expand_px"] = expand_px
         st.session_state["manual_shrink_px"] = shrink_px
         st.session_state["manual_feather_px"] = feather_px
+        st.session_state["manual_combine_mode"] = combine_mode
 
-        # Real-time preview for manual cutout result.
-        base_rgba = fg_preview.convert("RGBA")
-        base_keep = None
-        preview_info = "手工掩码预览（仅预览，最终以开始推荐时重新计算为准）"
-        if manual_seed_mode == "智能抠图结果":
-            try:
-                auto_rgba, _ = remove_background(fg_preview, target=cutout_target)
-                base_keep = (np.asarray(auto_rgba, dtype=np.uint8)[..., 3] > 20).astype(np.float32)
-            except Exception:
-                base_keep = None
-        keep_mask_preview = _get_canvas_mask(
-            canvas_result.image_data,
-            target_size=base_rgba.size,
-            base_keep_mask=base_keep,
-            expand_px=expand_px,
-            shrink_px=shrink_px,
-            feather_px=feather_px,
-        )
-        fg_manual_preview = apply_manual_alpha_mask(base_rgba, keep_mask_preview, feather=1)
-        if post_cfg:
-            fg_manual_preview = refine_rgba_cutout(
-                fg_manual_preview,
-                alpha_threshold=int(post_cfg.get("alpha_threshold", 12)),
-                keep_largest=bool(post_cfg.get("keep_largest", True)),
-                feather_radius=int(post_cfg.get("feather_radius", 2)),
-                auto_crop=bool(post_cfg.get("auto_crop", True)),
-                crop_padding=int(post_cfg.get("crop_padding", 6)),
-                invert_mask=bool(post_cfg.get("invert_mask", False)),
+        apply_cols = st.columns(2)
+        with apply_cols[0]:
+            apply_clicked = st.button("应用手工抠图结果", type="primary")
+        with apply_cols[1]:
+            if st.button("丢弃已应用结果"):
+                st.session_state["manual_applied_rgba"] = None
+                st.session_state["manual_applied_info"] = None
+                st.rerun()
+
+        if apply_clicked:
+            base_rgba = fg_preview.convert("RGBA")
+            base_keep = None
+            if manual_seed_mode == "智能抠图结果":
+                if auto_seed_rgba is not None:
+                    base_keep = (np.asarray(auto_seed_rgba, dtype=np.uint8)[..., 3] > 20).astype(np.float32)
+
+            keep_delta, erase_delta = _get_canvas_mask(
+                canvas_result.image_data,
+                target_size=base_rgba.size,
             )
-        st.image(fg_manual_preview, caption=preview_info, use_container_width=True)
+            keep_mask = _compose_manual_keep_mask(
+                base_keep_mask=base_keep,
+                keep_delta=keep_delta,
+                erase_delta=erase_delta,
+                combine_mode=combine_mode,
+                expand_px=expand_px,
+                shrink_px=shrink_px,
+                feather_px=feather_px,
+            )
+            fg_manual = apply_manual_alpha_mask(base_rgba, keep_mask, feather=1)
+            if post_cfg:
+                fg_manual = refine_rgba_cutout(
+                    fg_manual,
+                    alpha_threshold=int(post_cfg.get("alpha_threshold", 12)),
+                    keep_largest=bool(post_cfg.get("keep_largest", True)),
+                    feather_radius=int(post_cfg.get("feather_radius", 2)),
+                    auto_crop=bool(post_cfg.get("auto_crop", True)),
+                    crop_padding=int(post_cfg.get("crop_padding", 6)),
+                    invert_mask=bool(post_cfg.get("invert_mask", False)),
+                )
+            st.session_state["manual_applied_rgba"] = fg_manual
+            st.session_state["manual_applied_info"] = (
+                f"已应用手工抠图：融合={combine_mode}，保留笔迹={int((keep_delta>0.1).sum())}，"
+                f"擦除笔迹={int((erase_delta>0.1).sum())}"
+            )
+            st.session_state["manual_applied_source_id"] = fg_source_id
+
+        if st.session_state.get("manual_applied_rgba") is not None and st.session_state.get("manual_applied_source_id") == fg_source_id:
+            _show_small_rgba_preview(
+                st.session_state["manual_applied_rgba"],
+                caption=st.session_state.get("manual_applied_info", "已应用手工抠图结果"),
+                max_w=520,
+            )
+        else:
+            st.caption("尚未应用手工抠图结果。请完成绘制后点击“应用手工抠图结果”。")
     else:
         st.info("请先上传前景图后再进行手工抠图。")
 
-if st.button("开始推荐"):
+if cutout_mode == "一键智能抠图(U2Net)" and fg_file is not None:
+    fg_source_id = _uploaded_file_id(fg_file)
+    fg_preview = Image.open(fg_file).convert("RGB")
+    auto_seed_rgba = _get_cached_auto_seed_rgba(
+        fg_preview=fg_preview,
+        fg_source_id=fg_source_id,
+        cutout_target=cutout_target,
+        show_spinner=False,
+    )
+    if auto_seed_rgba is not None:
+        _show_small_rgba_preview(auto_seed_rgba, caption="一键智能抠图预览")
+
+action_cols = st.columns([1, 1, 4])
+with action_cols[0]:
+    start_recommend = st.button("开始推荐", type="primary")
+with action_cols[1]:
+    clear_results = st.button("清除当前推荐结果")
+
+if clear_results:
+    for key in [
+        "last_result",
+        "last_heatmap",
+        "last_heatmap_overlay",
+        "manual_score_result",
+        "manual_drag_x",
+        "manual_drag_y",
+    ]:
+        st.session_state.pop(key, None)
+    st.rerun()
+
+if start_recommend:
     if bg_file is None or fg_file is None:
         st.warning("请先上传背景图和前景图。")
     else:
@@ -455,39 +729,14 @@ if st.button("开始推荐"):
         if cutout_mode == "一键智能抠图(U2Net)":
             base_fg_rgba, fg_info = remove_background(raw_fg, target=cutout_target)
         elif cutout_mode == "手工抠图(画笔)":
-            base_fg_rgba = raw_fg.convert("RGBA")
-            canvas_data = st.session_state.get("manual_canvas_data")
-            manual_seed_mode = st.session_state.get("manual_seed_mode", "空白")
-            manual_expand_px = int(st.session_state.get("manual_expand_px", 2))
-            manual_shrink_px = int(st.session_state.get("manual_shrink_px", 0))
-            manual_feather_px = int(st.session_state.get("manual_feather_px", 2))
-            base_keep = None
-            if manual_seed_mode == "智能抠图结果":
-                try:
-                    auto_rgba, _ = remove_background(raw_fg, target=cutout_target)
-                    base_keep = (np.asarray(auto_rgba, dtype=np.uint8)[..., 3] > 20).astype(np.float32)
-                except Exception:
-                    base_keep = None
-            if canvas_data is not None:
-                keep_mask = _get_canvas_mask(
-                    canvas_data,
-                    target_size=base_fg_rgba.size,
-                    base_keep_mask=base_keep,
-                    expand_px=manual_expand_px,
-                    shrink_px=manual_shrink_px,
-                    feather_px=manual_feather_px,
-                )
-                if float(keep_mask.mean()) > 1e-4:
-                    base_fg_rgba = apply_manual_alpha_mask(base_fg_rgba, keep_mask, feather=2)
-                    fg_info = "已使用手工抠图（支持保留/擦除、曲线绘制、边缘细化）。"
-                else:
-                    if base_keep is not None and float(base_keep.mean()) > 1e-4:
-                        base_fg_rgba = apply_manual_alpha_mask(base_fg_rgba, base_keep, feather=2)
-                        fg_info = "未检测到手工涂抹，已使用智能抠图初始化结果。"
-                    else:
-                        fg_info = "未检测到画笔涂抹，已使用原图。"
-            else:
-                fg_info = "未检测到手工抠图数据，已使用原图。"
+            fg_source_id = _uploaded_file_id(fg_file)
+            applied = st.session_state.get("manual_applied_rgba")
+            applied_id = st.session_state.get("manual_applied_source_id")
+            if applied is None or applied_id != fg_source_id:
+                st.warning("请先在手工抠图面板点击“应用手工抠图结果”。")
+                st.stop()
+            base_fg_rgba = applied.convert("RGBA")
+            fg_info = st.session_state.get("manual_applied_info", "已使用手工抠图结果。")
         else:
             base_fg_rgba = raw_fg.convert("RGBA")
 
@@ -514,9 +763,9 @@ if st.button("开始推荐"):
             st.caption(f"背景图尺寸保持不变: {orig_bg_size[0]}x{orig_bg_size[1]}")
         preview_cols = st.columns(2)
         with preview_cols[0]:
-            st.image(bg, caption="背景图", use_container_width=True)
+            st.image(bg, caption="背景图", width="stretch")
         with preview_cols[1]:
-            st.image(fg, caption="处理后前景图", use_container_width=True)
+            st.image(fg, caption="处理后前景图", width="stretch")
 
         with st.spinner("本地推理中..."):
             t0 = time.time()
@@ -535,9 +784,10 @@ if st.button("开始推荐"):
 
                 merged_rows = []
                 merged_images = []
+                scale_heatmaps = []
                 seen = set()
-                scorer = _load_scorer(model_backend)
-
+                scorer = ReferenceOPAScorer(device="auto")
+                
                 scale_values = sorted(set(max(0.3, min(2.5, s)) for s in scales))
                 effective_compose_workers = (
                     1 if parallel_scale_search and len(scale_values) > 1 else cpu_compose_workers
@@ -546,11 +796,12 @@ if st.button("开始推荐"):
                 def search_one_scale(sc: float):
                     fg_sc = resize_foreground(base_fg_rgba, sc * bg_resize_factor)
                     fg_sc = fit_foreground_to_background(fg_sc, bg)
-                    return rank_candidates(
+                    return rank_candidates_heatmap_guided(
                         bg,
                         fg_sc,
                         top_k=max(top_k, 6),
                         candidate_count=search_budget,
+                        heatmap_grid=heat_grid,
                         scale_tag=sc,
                         scorer=scorer,
                         compose_workers=effective_compose_workers,
@@ -562,14 +813,16 @@ if st.button("开始推荐"):
                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
                         futures = {executor.submit(search_one_scale, sc): sc for sc in scale_values}
                         for future in as_completed(futures):
-                            scale_results.append((futures[future], *future.result()))
+                            sc = futures[future]
+                            rows_sc, images_sc, hm_sc = future.result()
+                            scale_results.append((sc, rows_sc, images_sc, hm_sc))
                     scale_results.sort(key=lambda item: item[0])
                 else:
                     for sc in scale_values:
-                        rows_sc, images_sc = search_one_scale(sc)
-                        scale_results.append((sc, rows_sc, images_sc))
+                        rows_sc, images_sc, hm_sc = search_one_scale(sc)
+                        scale_results.append((sc, rows_sc, images_sc, hm_sc))
 
-                for _, rows_sc, images_sc in scale_results:
+                for sc, rows_sc, images_sc, hm_sc in scale_results:
                     for r, img in zip(rows_sc, images_sc):
                         key = (int(r["x"]), int(r["y"]), round(float(r["scale"]), 2))
                         if key in seen:
@@ -577,6 +830,9 @@ if st.button("开始推荐"):
                         seen.add(key)
                         merged_rows.append(r)
                         merged_images.append(img)
+                    fg_width = int(base_fg_rgba.size[0] * sc * bg_resize_factor)
+                    fg_height = int(base_fg_rgba.size[1] * sc * bg_resize_factor)
+                    scale_heatmaps.append((sc, hm_sc, fg_width, fg_height))
 
                 merged = sorted(
                     list(zip(merged_rows, merged_images)), key=lambda t: float(t[0]["score"]), reverse=True
@@ -585,16 +841,12 @@ if st.button("开始推荐"):
                 images = [x[1] for x in merged]
                 hm = None
                 hm_overlay = None
-                if precompute_heatmap:
-                    hm = score_heatmap(
-                        bg,
-                        fg,
-                        grid_size=heat_grid,
-                        scorer=scorer,
-                        compose_workers=cpu_compose_workers,
-                    )
+                if precompute_heatmap and scale_heatmaps:
+                    best_scale = float(ranked[0]["scale"]) if ranked else scale_heatmaps[0][0]
+                    chosen = min(scale_heatmaps, key=lambda t: abs(t[0] - best_scale))
+                    hm = chosen[1]
                     hm_overlay = _draw_topk_markers(
-                        _render_heatmap_overlay(bg, hm), ranked, fg.size[0], fg.size[1]
+                        _render_heatmap_overlay(bg, hm), ranked, int(chosen[2]), int(chosen[3])
                     )
             except Exception as exc:
                 st.error(f"推理失败: {exc}")
@@ -611,11 +863,11 @@ if st.button("开始推荐"):
             "orig_bg_size": orig_bg_size,
             "resized_bg_size": resized_bg_size,
             "device": str(scorer.device),
-            "model_backend": model_backend,
             "parallel_scale_search": bool(parallel_scale_search and len(scale_values) > 1),
             "cpu_compose_workers": int(cpu_compose_workers),
             "effective_compose_workers": int(effective_compose_workers),
         }
+        st.session_state["manual_score_result"] = None
         st.session_state["last_heatmap"] = hm
         st.session_state["last_heatmap_overlay"] = hm_overlay
 
@@ -628,14 +880,13 @@ if "last_result" in st.session_state:
     images = res["images"]
     latency_ms = res["latency_ms"]
     device_used = res.get("device", "cpu")
-    model_used = res.get("model_backend", "Student CNN")
     parallel_used = res.get("parallel_scale_search", False)
     cpu_workers = res.get("cpu_compose_workers", 1)
     effective_workers = res.get("effective_compose_workers", cpu_workers)
 
     st.success(f"完成。总耗时 {latency_ms:.1f} ms")
     st.caption(
-        f"评分模型：`{model_used}`；推理设备：`{device_used}`（自动优先 GPU，不可用时回退 CPU）；"
+        f"推理设备：`{device_used}`（自动优先 GPU，不可用时回退 CPU）；"
         f"多尺度并行：{'开启' if parallel_used else '关闭'}；"
         f"CPU合成线程：{cpu_workers}（搜索实际使用 {effective_workers}）"
     )
@@ -650,7 +901,7 @@ if "last_result" in st.session_state:
             st.image(
                 img,
                 caption=f"#{i+1} 分数={row['score']:.3f} ({row['level']}) | scale={row['scale']:.2f}",
-                use_container_width=True,
+                width="stretch",
             )
             st.write(f"位置: x={row['x']}, y={row['y']}")
             cur_fg_w = max(16, int(base_fg_rgba.size[0] * float(row["scale"])))
@@ -667,34 +918,148 @@ if "last_result" in st.session_state:
             st.caption("；".join(tips[:2]))
 
     st.subheader("排序结果")
-    st.dataframe(ranked, use_container_width=True)
+    st.dataframe(ranked, width="stretch")
 
     st.subheader("手动微调打分")
     default_x = int(ranked[0]["x"]) if ranked else 0
     default_y = int(ranked[0]["y"]) if ranked else 0
+    default_scale = float(ranked[0]["scale"]) if ranked else 1.0
     max_x = max(0, bg.size[0] - fg.size[0])
     max_y = max(0, bg.size[1] - fg.size[1])
-    col_m1, col_m2 = st.columns(2)
-    with col_m1:
-        manual_x = st.slider("手动X位置", min_value=0, max_value=max_x, value=min(default_x, max_x), step=1)
-    with col_m2:
-        manual_y = st.slider("手动Y位置", min_value=0, max_value=max_y, value=min(default_y, max_y), step=1)
-    if st.button("计算手动位置分数"):
-        scorer = _load_scorer(model_backend)
-        manual = score_single_position(bg, fg, manual_x, manual_y, scorer=scorer)
-        st.image(
-            manual["image"],
-            caption=f"手动位置分数={manual['score']:.3f} ({manual['level']}) @ ({manual['x']},{manual['y']})",
-            use_container_width=True,
+    manual_x = int(st.session_state.get("manual_drag_x", min(default_x, max_x)))
+    manual_y = int(st.session_state.get("manual_drag_y", min(default_y, max_y)))
+    manual_scale = float(st.session_state.get("manual_drag_scale", default_scale))
+    manual_scale = st.slider("手动缩放（拖拽模式）", min_value=0.3, max_value=2.5, value=manual_scale, step=0.01)
+    st.session_state["manual_drag_scale"] = manual_scale
+    manual_bg_resize_factor = float(res["resized_bg_size"][0]) / max(1.0, float(res["orig_bg_size"][0]))
+
+    use_drag_manual = HAS_DRAWABLE_CANVAS
+    if use_drag_manual:
+        st.caption("直接拖动图中前景贴图到目标位置，再点击计算分数。")
+        fg_manual_drag = resize_foreground(base_fg_rgba, manual_scale * manual_bg_resize_factor)
+        fg_manual_drag = fit_foreground_to_background(fg_manual_drag, bg)
+        max_x_drag = max(0, bg.size[0] - fg_manual_drag.size[0])
+        max_y_drag = max(0, bg.size[1] - fg_manual_drag.size[1])
+        manual_x = max(0, min(max_x_drag, manual_x))
+        manual_y = max(0, min(max_y_drag, manual_y))
+
+        drag_cache_key = (
+            f"{fg_manual_drag.size[0]}x{fg_manual_drag.size[1]}|"
+            f"{_uploaded_file_id(fg_file)}|bg:{bg.size[0]}x{bg.size[1]}"
         )
+        if st.session_state.get("manual_drag_fg_data_url_key") != drag_cache_key:
+            st.session_state["manual_drag_fg_data_url"] = _pil_rgba_to_data_url(fg_manual_drag)
+            st.session_state["manual_drag_fg_data_url_key"] = drag_cache_key
+        fg_data_url = st.session_state.get("manual_drag_fg_data_url")
+
+        init_image = {
+            "version": "4.4.0",
+            "objects": [
+                {
+                    "type": "image",
+                    "left": float(manual_x),
+                    "top": float(manual_y),
+                    "width": float(fg_manual_drag.size[0]),
+                    "height": float(fg_manual_drag.size[1]),
+                    "scaleX": 1.0,
+                    "scaleY": 1.0,
+                    "src": fg_data_url,
+                    "lockRotation": True,
+                    "lockScalingX": True,
+                    "lockScalingY": True,
+                }
+            ],
+        }
+        # Reset drag state only when source image/size context changes.
+        if st.session_state.get("manual_drag_state_key") != drag_cache_key:
+            st.session_state["manual_drag_state_key"] = drag_cache_key
+            st.session_state["manual_drag_x"] = manual_x
+            st.session_state["manual_drag_y"] = manual_y
+            st.session_state["manual_drag_canvas_key"] = f"manual_drag_canvas_image_{time.time_ns()}"
+        if "manual_drag_canvas_key" not in st.session_state:
+            st.session_state["manual_drag_canvas_key"] = f"manual_drag_canvas_image_{time.time_ns()}"
+
+        drag_canvas = st_canvas(
+            fill_color="rgba(0,0,0,0)",
+            stroke_width=1,
+            stroke_color="#FFD400",
+            background_image=bg,
+            update_streamlit=False,
+            width=bg.size[0],
+            height=bg.size[1],
+            drawing_mode="transform",
+            # Always inject a valid foreground object with stable src to prevent
+            # the object from disappearing after reruns.
+            initial_drawing=init_image,
+            display_toolbar=False,
+            key=st.session_state["manual_drag_canvas_key"],
+        )
+        current_drag_json = drag_canvas.json_data
+        if current_drag_json is not None:
+            manual_x_preview, manual_y_preview = _extract_image_xy_from_canvas(
+                json_data=current_drag_json,
+                default_x=manual_x,
+                default_y=manual_y,
+                max_x=max_x_drag,
+                max_y=max_y_drag,
+            )
+            st.session_state["manual_drag_x"] = manual_x_preview
+            st.session_state["manual_drag_y"] = manual_y_preview
+        else:
+            manual_x_preview = int(st.session_state.get("manual_drag_x", manual_x))
+            manual_y_preview = int(st.session_state.get("manual_drag_y", manual_y))
+        st.caption(f"当前位置：x={manual_x_preview}, y={manual_y_preview}；缩放={manual_scale:.3f}")
+        manual_submit = st.button("计算推荐分数（当前位置）")
+    else:
+        with st.form("manual_score_form", clear_on_submit=False):
+            c_a, c_b, c_c = st.columns(3)
+            with c_a:
+                manual_x = st.slider("手动X位置", min_value=0, max_value=max_x, value=manual_x, step=1)
+            with c_b:
+                manual_y = st.slider("手动Y位置", min_value=0, max_value=max_y, value=manual_y, step=1)
+            with c_c:
+                manual_scale = st.slider("手动缩放", min_value=0.3, max_value=2.5, value=float(default_scale), step=0.01)
+            manual_submit = st.form_submit_button("计算推荐分数")
+
+    if manual_submit:
+        scorer = ReferenceOPAScorer(device="auto")
+        fg_manual = resize_foreground(base_fg_rgba, manual_scale * manual_bg_resize_factor)
+        fg_manual = fit_foreground_to_background(fg_manual, bg)
+        if use_drag_manual:
+            current_drag_json = drag_canvas.json_data
+            manual_x, manual_y = _extract_image_xy_from_canvas(
+                json_data=current_drag_json,
+                default_x=int(st.session_state.get("manual_drag_x", manual_x)),
+                default_y=int(st.session_state.get("manual_drag_y", manual_y)),
+                max_x=max(0, bg.size[0] - fg_manual.size[0]),
+                max_y=max(0, bg.size[1] - fg_manual.size[1]),
+            )
+            st.session_state["manual_drag_x"] = manual_x
+            st.session_state["manual_drag_y"] = manual_y
+        manual = score_single_position(bg, fg_manual, manual_x, manual_y, scorer=scorer)
         tips = analyze_candidate(
             x=int(manual["x"]),
             y=int(manual["y"]),
-            fg_w=fg.size[0],
-            fg_h=fg.size[1],
+            fg_w=fg_manual.size[0],
+            fg_h=fg_manual.size[1],
             bg_w=bg.size[0],
             bg_h=bg.size[1],
             score=float(manual["score"]),
+        )
+        st.session_state["manual_score_result"] = {
+            "manual": manual,
+            "tips": tips,
+            "scale": float(manual_scale),
+        }
+
+    if st.session_state.get("manual_score_result") is not None:
+        cached = st.session_state["manual_score_result"]
+        manual = cached["manual"]
+        tips = cached["tips"]
+        man_scale = float(cached.get("scale", 1.0))
+        st.success(
+            f"当前位置分数={manual['score']:.3f}（{manual['level']}），"
+            f"x={manual['x']}, y={manual['y']}, scale={man_scale:.3f}"
         )
         st.caption("；".join(tips))
 
@@ -705,7 +1070,7 @@ if "last_result" in st.session_state:
         st.image(
             overlay_with_marks,
             caption=f"红色越强表示估计得分越高，已叠加 Top-K 标记点",
-            use_container_width=True,
+            width="stretch",
         )
         if hm is not None:
             st.caption(f"热力图统计: min={float(hm.min()):.3f}, max={float(hm.max()):.3f}, gap={float(hm.max()-hm.min()):.3f}")
