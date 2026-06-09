@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from typing import Dict, List, Tuple
 
@@ -16,6 +17,29 @@ def _chunked(items: List[Tuple[int, int]], chunk_size: int) -> List[List[Tuple[i
 
 def _clip_position(x: int, y: int, max_x: int, max_y: int) -> Tuple[int, int]:
     return int(np.clip(x, 0, max_x)), int(np.clip(y, 0, max_y))
+
+
+def _compose_many(
+    background_rgb: np.ndarray,
+    foreground_rgba: np.ndarray,
+    positions: List[Tuple[int, int]],
+    max_workers: int = 1,
+    executor: ThreadPoolExecutor | None = None,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    max_workers = max(1, int(max_workers))
+    if max_workers == 1 or len(positions) <= 1:
+        pairs = [compose_rgba(background_rgb, foreground_rgba, x, y) for x, y in positions]
+    else:
+        def compose_one(pos: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+            x, y = pos
+            return compose_rgba(background_rgb, foreground_rgba, x, y)
+
+        if executor is None:
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(positions))) as local_executor:
+                pairs = list(local_executor.map(compose_one, positions))
+        else:
+            pairs = list(executor.map(compose_one, positions))
+    return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
 def _generate_seed_positions(
@@ -72,6 +96,7 @@ def rank_candidates(
     candidate_count: int = 12,
     scale_tag: float = 1.0,
     scorer: ReferenceOPAScorer | None = None,
+    compose_workers: int = 1,
 ) -> Tuple[List[Dict], List[Image.Image]]:
     bg = pil_to_rgb_np(background)
     fg = pil_to_rgba_np(foreground)
@@ -82,82 +107,120 @@ def rank_candidates(
 
     score_cache: Dict[Tuple[int, int], float] = {}
     simopa_scorer = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
+    compose_workers = max(1, int(compose_workers))
+    score_chunk_size = max(6, compose_workers * 4)
+    compose_executor = (
+        ThreadPoolExecutor(max_workers=compose_workers) if compose_workers > 1 else None
+    )
 
-    def score_positions(positions: List[Tuple[int, int]], chunk_size: int = 6) -> List[float]:
+    def score_positions(positions: List[Tuple[int, int]], chunk_size: int = score_chunk_size) -> List[float]:
         clipped = [_clip_position(x, y, max_x, max_y) for x, y in positions]
         pending = [p for p in clipped if p not in score_cache]
         if pending:
             for chunk in _chunked(pending, chunk_size):
-                composites: List[np.ndarray] = []
-                masks: List[np.ndarray] = []
-                for x, y in chunk:
-                    comp, mask = compose_rgba(bg, fg, x, y)
-                    composites.append(comp)
-                    masks.append(mask)
+                composites, masks = _compose_many(
+                    bg,
+                    fg,
+                    chunk,
+                    max_workers=compose_workers,
+                    executor=compose_executor,
+                )
                 new_scores = simopa_scorer.score_batch(composites, masks)
                 for pos, score in zip(chunk, new_scores):
                     score_cache[pos] = float(score)
         return [score_cache[p] for p in clipped]
 
-    # Stage 1: broad search.
-    seed_positions = _generate_seed_positions(bg_w, bg_h, fg_w, fg_h, candidate_count)
-    seed_scores = score_positions(seed_positions)
-    ranked_seed = sorted(zip(seed_positions, seed_scores), key=lambda t: t[1], reverse=True)
+    try:
+        # Stage 1: broad search.
+        seed_positions = _generate_seed_positions(bg_w, bg_h, fg_w, fg_h, candidate_count)
+        seed_scores = score_positions(seed_positions)
+        ranked_seed = sorted(zip(seed_positions, seed_scores), key=lambda t: t[1], reverse=True)
 
-    # Stage 2: local pattern search around elites.
-    elite_count = min(10, max(4, candidate_count // 2), len(ranked_seed))
-    elite_positions = [ranked_seed[i][0] for i in range(elite_count)]
-    refined_positions: List[Tuple[int, int]] = []
-    init_step = max(6, min(bg_w, bg_h) // 10)
-    for start in elite_positions:
-        cur_x, cur_y = start
-        cur_score = score_positions([(cur_x, cur_y)])[0]
-        step = init_step
-        while step >= 2:
-            neighbors = [
-                (cur_x + step, cur_y),
-                (cur_x - step, cur_y),
-                (cur_x, cur_y + step),
-                (cur_x, cur_y - step),
-                (cur_x + step, cur_y + step),
-                (cur_x + step, cur_y - step),
-                (cur_x - step, cur_y + step),
-                (cur_x - step, cur_y - step),
-            ]
-            neighbors = [_clip_position(x, y, max_x, max_y) for x, y in neighbors]
-            neigh_scores = score_positions(neighbors)
-            best_idx = int(np.argmax(neigh_scores))
-            if neigh_scores[best_idx] > cur_score + 1e-6:
-                cur_x, cur_y = neighbors[best_idx]
-                cur_score = neigh_scores[best_idx]
-            else:
-                step //= 2
-        refined_positions.append((cur_x, cur_y))
+        # Stage 2: batched local pattern search around elites.
+        elite_count = min(10, max(4, candidate_count // 2), len(ranked_seed))
+        elite_positions = [ranked_seed[i][0] for i in range(elite_count)]
+        init_step = max(6, min(bg_w, bg_h) // 10)
 
-    all_positions = seed_positions + refined_positions
-    all_scores = score_positions(all_positions)
+        def refine_elites_batched(starts: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+            if not starts:
+                return []
 
-    rows: List[Candidate] = []
-    seen = set()
-    for (x, y), score in sorted(zip(all_positions, all_scores), key=lambda t: t[1], reverse=True):
-        if (x, y) in seen:
-            continue
-        seen.add((x, y))
-        rows.append(Candidate(x=x, y=y, score=float(score), level=classify_score(float(score))))
+            cur_positions = [_clip_position(x, y, max_x, max_y) for x, y in starts]
+            cur_scores = score_positions(cur_positions)
+            steps = [init_step for _ in cur_positions]
+            active = [True for _ in cur_positions]
 
-    rows = rows[: max(candidate_count * 2, 20)]
-    min_dist = max(10.0, min(fg_w, fg_h) * 0.35)
-    top_rows = _select_diverse_top(rows, top_k=top_k, min_dist=min_dist)
-    out = [asdict(r) for r in top_rows]
+            while any(active):
+                active_indices: List[int] = []
+                neighbor_groups: List[List[Tuple[int, int]]] = []
+                flat_neighbors: List[Tuple[int, int]] = []
 
-    top_rendered: List[Image.Image] = []
-    for r in top_rows:
-        comp, _ = compose_rgba(bg, fg, r.x, r.y)
-        top_rendered.append(Image.fromarray((comp * 255).astype(np.uint8)))
-    # Add scale metadata for multi-scale merge.
-    for item in out:
-        item["scale"] = float(scale_tag)
-    return out, top_rendered
+                for idx, is_active in enumerate(active):
+                    if not is_active:
+                        continue
+                    cur_x, cur_y = cur_positions[idx]
+                    step = steps[idx]
+                    neighbors = [
+                        (cur_x + step, cur_y),
+                        (cur_x - step, cur_y),
+                        (cur_x, cur_y + step),
+                        (cur_x, cur_y - step),
+                        (cur_x + step, cur_y + step),
+                        (cur_x + step, cur_y - step),
+                        (cur_x - step, cur_y + step),
+                        (cur_x - step, cur_y - step),
+                    ]
+                    clipped_neighbors = [_clip_position(x, y, max_x, max_y) for x, y in neighbors]
+                    active_indices.append(idx)
+                    neighbor_groups.append(clipped_neighbors)
+                    flat_neighbors.extend(clipped_neighbors)
+
+                flat_scores = score_positions(flat_neighbors)
+                offset = 0
+                for idx, neighbors in zip(active_indices, neighbor_groups):
+                    neigh_scores = flat_scores[offset : offset + len(neighbors)]
+                    offset += len(neighbors)
+                    best_idx = int(np.argmax(neigh_scores))
+                    best_score = float(neigh_scores[best_idx])
+                    if best_score > cur_scores[idx] + 1e-6:
+                        cur_positions[idx] = neighbors[best_idx]
+                        cur_scores[idx] = best_score
+                    else:
+                        steps[idx] //= 2
+                        if steps[idx] < 2:
+                            active[idx] = False
+
+            return cur_positions
+
+        refined_positions = refine_elites_batched(elite_positions)
+
+        all_positions = seed_positions + refined_positions
+        all_scores = score_positions(all_positions)
+
+        rows: List[Candidate] = []
+        seen = set()
+        for (x, y), score in sorted(zip(all_positions, all_scores), key=lambda t: t[1], reverse=True):
+            if (x, y) in seen:
+                continue
+            seen.add((x, y))
+            rows.append(Candidate(x=x, y=y, score=float(score), level=classify_score(float(score))))
+
+        rows = rows[: max(candidate_count * 2, 20)]
+        min_dist = max(10.0, min(fg_w, fg_h) * 0.35)
+        top_rows = _select_diverse_top(rows, top_k=top_k, min_dist=min_dist)
+        out = [asdict(r) for r in top_rows]
+
+        top_rendered: List[Image.Image] = []
+        for r in top_rows:
+            comp, _ = compose_rgba(bg, fg, r.x, r.y)
+            top_rendered.append(Image.fromarray((comp * 255).astype(np.uint8)))
+        # Add scale metadata for multi-scale merge.
+        for item in out:
+            item["scale"] = float(scale_tag)
+        return out, top_rendered
+    finally:
+        if compose_executor is not None:
+            compose_executor.shutdown(wait=True)
 
 
 def score_single_position(
@@ -192,6 +255,7 @@ def score_heatmap(
     foreground: Image.Image,
     grid_size: int = 14,
     scorer: ReferenceOPAScorer | None = None,
+    compose_workers: int = 1,
 ) -> np.ndarray:
     bg = pil_to_rgb_np(background)
     fg = pil_to_rgba_np(foreground)
@@ -206,14 +270,24 @@ def score_heatmap(
     pos = [(int(x), int(y)) for y in ys for x in xs]
 
     sc = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
+    compose_workers = max(1, int(compose_workers))
+    score_chunk_size = max(4, compose_workers * 4)
     scores: List[float] = []
-    for chunk in _chunked(pos, chunk_size=4):
-        composites: List[np.ndarray] = []
-        masks: List[np.ndarray] = []
-        for x, y in chunk:
-            comp, mask = compose_rgba(bg, fg, x, y)
-            composites.append(comp)
-            masks.append(mask)
-        scores.extend(sc.score_batch(composites, masks))
+    compose_executor = (
+        ThreadPoolExecutor(max_workers=compose_workers) if compose_workers > 1 else None
+    )
+    try:
+        for chunk in _chunked(pos, chunk_size=score_chunk_size):
+            composites, masks = _compose_many(
+                bg,
+                fg,
+                chunk,
+                max_workers=compose_workers,
+                executor=compose_executor,
+            )
+            scores.extend(sc.score_batch(composites, masks))
+    finally:
+        if compose_executor is not None:
+            compose_executor.shutdown(wait=True)
     arr = np.array(scores, dtype=np.float32).reshape(grid_size, grid_size)
     return arr

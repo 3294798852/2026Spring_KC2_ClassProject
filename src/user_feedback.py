@@ -11,17 +11,11 @@ def analyze_candidate(
     score: float,
 ) -> List[str]:
     tips: List[str] = []
-    margin = max(8, min(fg_w, fg_h) // 6)
     cx = x + fg_w / 2.0
     cy = y + fg_h / 2.0
 
-    if x <= margin or y <= margin or (x + fg_w) >= (bg_w - margin) or (y + fg_h) >= (bg_h - margin):
-        tips.append("目标贴近边缘，可能造成越界/裁切不自然。")
-
     if cy < bg_h * 0.35:
         tips.append("目标位置偏高，常见场景中容易缺少支撑关系。")
-    elif cy > bg_h * 0.9:
-        tips.append("目标位置过低，建议上移避免贴底。")
 
     horizontal_dist = abs(cx - bg_w / 2.0) / max(bg_w, 1)
     if horizontal_dist > 0.42:

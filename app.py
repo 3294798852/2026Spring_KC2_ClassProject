@@ -1,7 +1,9 @@
 import io
 import json
+import os
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Optional
 
@@ -18,7 +20,9 @@ from src.foreground import (
 )
 from src.image_preprocess import resize_by_long_edge
 from src.infer import rank_candidates, score_heatmap, score_single_position
-from src.reference_opa import ReferenceOPAScorer, ensure_simopa_weight
+from src.config import STUDENT_CNN_PATH
+from src.opa import BACKENDS, REFERENCE_BACKEND, STUDENT_BACKEND, create_opa_scorer
+from src.reference_opa import ensure_simopa_weight
 from src.user_feedback import analyze_candidate, spread_summary
 
 try:
@@ -31,7 +35,12 @@ except Exception:
 
 st.set_page_config(page_title="方向A-物体放置助手", layout="wide")
 st.title("方向 A：智能物体放置与质量评分（本地推理）")
-st.caption("主线模型：BCMI/libcom 的 SimOPA（已移除 legacy 路径）。")
+st.caption("评分模型可在侧边栏快速切换：Student CNN 或原始 SimOPA。")
+
+
+@st.cache_resource(show_spinner=False)
+def _load_scorer(model_backend: str):
+    return create_opa_scorer(model_backend, device="auto")
 
 
 def _image_to_png_bytes(img: Image.Image) -> bytes:
@@ -225,6 +234,16 @@ def _safe_canvas(
 
 with st.sidebar:
     st.header("模型与权重")
+    model_backend = st.selectbox(
+        "评分模型",
+        options=BACKENDS,
+        index=0,
+        help="Student CNN 使用训练后的 models/student_cnn.pth；原始 SimOPA 使用 models/SimOPA.pth。",
+    )
+    if STUDENT_CNN_PATH.exists():
+        st.success(f"Student CNN 权重已就绪: {STUDENT_CNN_PATH}")
+    else:
+        st.warning("未找到 Student CNN 权重。请先运行 `scripts/train_student_cnn.py` 训练。")
     if st.button("下载/检查 SimOPA 参考权重"):
         with st.spinner("准备 SimOPA 权重中..."):
             try:
@@ -235,7 +254,10 @@ with st.sidebar:
                     "权重下载失败。请检查网络后重试，或手动将 `SimOPA.pth` 放到 `models/` 目录。"
                 )
                 st.caption(str(exc))
-    st.info("本版本仅保留 SimOPA 评分主线。首次建议先点击一次“下载/检查权重”。")
+    if model_backend == STUDENT_BACKEND:
+        st.info("当前网页推理会加载 `models/student_cnn.pth`。")
+    elif model_backend == REFERENCE_BACKEND:
+        st.info("当前网页推理会加载 `models/SimOPA.pth`。")
 
 bg_file = st.file_uploader(
     "上传背景图 (支持 jpg/jpeg/png/webp/bmp)",
@@ -285,6 +307,21 @@ resolution_profile = st.selectbox(
 
 st.subheader("搜索策略")
 enable_scale_search = st.checkbox("启用多尺度搜索（推荐）", value=True)
+parallel_scale_search = st.checkbox(
+    "并行执行多尺度搜索",
+    value=False,
+    disabled=not enable_scale_search,
+    help="并行的是不同缩放尺度的候选搜索；单个尺度内部仍使用批量模型推理。",
+)
+max_cpu_compose_workers = max(1, min(8, os.cpu_count() or 4))
+cpu_compose_workers = st.slider(
+    "CPU候选合成线程数",
+    min_value=1,
+    max_value=max_cpu_compose_workers,
+    value=1,
+    step=1,
+    help="并行加速候选图和mask的CPU合成；如果已开启多尺度并行，内部会自动减少嵌套线程。",
+)
 scale_offsets = st.multiselect(
     "额外尝试缩放",
     options=["-20%", "-10%", "+10%", "+20%"],
@@ -499,18 +536,40 @@ if st.button("开始推荐"):
                 merged_rows = []
                 merged_images = []
                 seen = set()
-                scorer = ReferenceOPAScorer(device="auto")
-                for sc in sorted(set(max(0.3, min(2.5, s)) for s in scales)):
+                scorer = _load_scorer(model_backend)
+
+                scale_values = sorted(set(max(0.3, min(2.5, s)) for s in scales))
+                effective_compose_workers = (
+                    1 if parallel_scale_search and len(scale_values) > 1 else cpu_compose_workers
+                )
+
+                def search_one_scale(sc: float):
                     fg_sc = resize_foreground(base_fg_rgba, sc * bg_resize_factor)
                     fg_sc = fit_foreground_to_background(fg_sc, bg)
-                    rows_sc, images_sc = rank_candidates(
+                    return rank_candidates(
                         bg,
                         fg_sc,
                         top_k=max(top_k, 6),
                         candidate_count=search_budget,
                         scale_tag=sc,
                         scorer=scorer,
+                        compose_workers=effective_compose_workers,
                     )
+
+                scale_results = []
+                if parallel_scale_search and len(scale_values) > 1:
+                    max_workers = min(4, len(scale_values))
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {executor.submit(search_one_scale, sc): sc for sc in scale_values}
+                        for future in as_completed(futures):
+                            scale_results.append((futures[future], *future.result()))
+                    scale_results.sort(key=lambda item: item[0])
+                else:
+                    for sc in scale_values:
+                        rows_sc, images_sc = search_one_scale(sc)
+                        scale_results.append((sc, rows_sc, images_sc))
+
+                for _, rows_sc, images_sc in scale_results:
                     for r, img in zip(rows_sc, images_sc):
                         key = (int(r["x"]), int(r["y"]), round(float(r["scale"]), 2))
                         if key in seen:
@@ -527,7 +586,13 @@ if st.button("开始推荐"):
                 hm = None
                 hm_overlay = None
                 if precompute_heatmap:
-                    hm = score_heatmap(bg, fg, grid_size=heat_grid, scorer=scorer)
+                    hm = score_heatmap(
+                        bg,
+                        fg,
+                        grid_size=heat_grid,
+                        scorer=scorer,
+                        compose_workers=cpu_compose_workers,
+                    )
                     hm_overlay = _draw_topk_markers(
                         _render_heatmap_overlay(bg, hm), ranked, fg.size[0], fg.size[1]
                     )
@@ -546,6 +611,10 @@ if st.button("开始推荐"):
             "orig_bg_size": orig_bg_size,
             "resized_bg_size": resized_bg_size,
             "device": str(scorer.device),
+            "model_backend": model_backend,
+            "parallel_scale_search": bool(parallel_scale_search and len(scale_values) > 1),
+            "cpu_compose_workers": int(cpu_compose_workers),
+            "effective_compose_workers": int(effective_compose_workers),
         }
         st.session_state["last_heatmap"] = hm
         st.session_state["last_heatmap_overlay"] = hm_overlay
@@ -559,9 +628,17 @@ if "last_result" in st.session_state:
     images = res["images"]
     latency_ms = res["latency_ms"]
     device_used = res.get("device", "cpu")
+    model_used = res.get("model_backend", "Student CNN")
+    parallel_used = res.get("parallel_scale_search", False)
+    cpu_workers = res.get("cpu_compose_workers", 1)
+    effective_workers = res.get("effective_compose_workers", cpu_workers)
 
     st.success(f"完成。总耗时 {latency_ms:.1f} ms")
-    st.caption(f"推理设备：`{device_used}`（自动优先 GPU，不可用时回退 CPU）")
+    st.caption(
+        f"评分模型：`{model_used}`；推理设备：`{device_used}`（自动优先 GPU，不可用时回退 CPU）；"
+        f"多尺度并行：{'开启' if parallel_used else '关闭'}；"
+        f"CPU合成线程：{cpu_workers}（搜索实际使用 {effective_workers}）"
+    )
     spread = spread_summary(ranked)
     st.caption(
         f"分数分布: min={spread['min']:.3f}, max={spread['max']:.3f}, "
@@ -603,7 +680,7 @@ if "last_result" in st.session_state:
     with col_m2:
         manual_y = st.slider("手动Y位置", min_value=0, max_value=max_y, value=min(default_y, max_y), step=1)
     if st.button("计算手动位置分数"):
-        scorer = ReferenceOPAScorer(device="auto")
+        scorer = _load_scorer(model_backend)
         manual = score_single_position(bg, fg, manual_x, manual_y, scorer=scorer)
         st.image(
             manual["image"],

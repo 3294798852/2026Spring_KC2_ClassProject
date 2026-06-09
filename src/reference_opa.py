@@ -12,6 +12,16 @@ from PIL import Image
 from src.config import SIMOPA_PATH
 
 
+def _select_device(device: str) -> torch.device:
+    if device != "auto":
+        return torch.device(device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 class SimOPAResNet(nn.Module):
     """
     SimOPA model from BCMI/libcom (OPA score).
@@ -81,9 +91,7 @@ class ReferenceOPAScorer:
         weight_path: Optional[Path] = None,
         score_temperature: float = 1.2,
     ) -> None:
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        self.device = _select_device(device)
         self.weight_path = ensure_simopa_weight(SIMOPA_PATH if weight_path is None else weight_path)
         self.model = SimOPAResNet().to(self.device).eval()
         state_dict = torch.load(self.weight_path, map_location="cpu", weights_only=True)

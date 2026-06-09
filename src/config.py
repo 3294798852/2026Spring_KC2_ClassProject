@@ -6,3 +6,4 @@ MODEL_DIR = ROOT_DIR / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
 SIMOPA_PATH = MODEL_DIR / "SimOPA.pth"
+STUDENT_CNN_PATH = MODEL_DIR / "student_cnn.pth"
