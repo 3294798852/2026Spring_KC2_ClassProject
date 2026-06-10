@@ -10,18 +10,22 @@
 ## 3. 模型改动（重点）
 - 输入改造：RGB -> RGB+mask
 - 输出改造：二分类 -> 0~1 分数 + 三档标签
-- 模型压缩：Teacher->Student 蒸馏 + 剪枝 + 量化
+- 轻量化蒸馏：Teacher SimOPA -> Student CNN（MobileNetV3-Small 4ch）
+- 蒸馏损失：CE + KD + Feature + Rank
+- 原型探索：Student Dual+Geom
 
 ## 4. 结果展示
 - Top-K 推荐截图
 - 好案例 / 坏案例对比
-- 推理速度与模型体积对比
+- 双后端对比（SimOPA vs Student）速度与分数分布
+- DenseMap 加速策略效果
 
 ## 5. 现场可证明“真实模型推理”
 - 展示终端日志
 - 指认权重加载与前向推理代码
 - 新图片现场测试
+- 展示训练日志文件（config/metrics/summary）证明实验可复现
 
 ## 6. 已知问题与后续计划
 - 真实场景泛化不足
-- 增加真实数据、引入 Grad-CAM、移动端封装
+- 增加真实数据、引入更严格评测指标、继续推进 FOPA 风格密集预测

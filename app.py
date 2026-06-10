@@ -23,8 +23,10 @@ from src.foreground import (
     resize_foreground,
 )
 from src.image_preprocess import resize_by_long_edge
-from src.infer import rank_candidates_heatmap_guided, score_single_position
-from src.reference_opa import ReferenceOPAScorer, ensure_simopa_weight
+from src.infer import rank_candidates_dense_map, rank_candidates_heatmap_guided, score_single_position
+from src.opa import BACKENDS, REFERENCE_BACKEND, STUDENT_BACKEND, create_opa_scorer
+from src.config import STUDENT_CNN_PATH, STUDENT_DUAL_PATH
+from src.reference_opa import ensure_simopa_weight
 from src.user_feedback import analyze_candidate, spread_summary
 
 
@@ -77,7 +79,7 @@ except Exception:
 
 st.set_page_config(page_title="方向A-物体放置助手", layout="wide")
 st.title("方向 A：智能物体放置与质量评分（本地推理）")
-st.caption("主线模型：BCMI/libcom 的 SimOPA（已移除 legacy 路径）。")
+st.caption("支持后端：原始 SimOPA 与轻量 Student CNN。")
 expected_device = "cuda" if torch.cuda.is_available() else "cpu"
 st.caption(f"预估推理设备：`{expected_device}`（启动推理前显示）")
 
@@ -141,11 +143,16 @@ def _build_export_zip(
     images: list[Image.Image],
     heatmap_overlay_with_marks: Image.Image | None,
     raw_heatmap: np.ndarray | None,
+    model_backend: str,
+    device_used: str,
+    compare_report: list[dict] | None = None,
 ) -> bytes:
     payload = io.BytesIO()
     with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         meta = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "model_backend": model_backend,
+            "device": device_used,
             "ranked": ranked,
         }
         if raw_heatmap is not None:
@@ -154,6 +161,8 @@ def _build_export_zip(
                 "max": float(raw_heatmap.max()),
                 "gap": float(raw_heatmap.max() - raw_heatmap.min()),
             }
+        if compare_report:
+            meta["compare_report"] = compare_report
         zf.writestr("ranking.json", json.dumps(meta, ensure_ascii=False, indent=2))
         for i, img in enumerate(images):
             zf.writestr(f"topk/top_{i+1}.png", _image_to_png_bytes(img))
@@ -438,6 +447,22 @@ def _extract_transform_from_canvas(
 
 with st.sidebar:
     st.header("模型与权重")
+    model_backend = st.selectbox(
+        "评分模型后端",
+        options=BACKENDS,
+        index=BACKENDS.index(REFERENCE_BACKEND),
+        help="原始 SimOPA：更稳健；Student CNN：更轻量，适合对比实验。",
+    )
+    if model_backend == STUDENT_BACKEND:
+        if STUDENT_CNN_PATH.exists():
+            st.caption(f"Student CNN 权重已找到：`{STUDENT_CNN_PATH}`")
+        else:
+            st.warning("未找到 Student CNN 权重。请先训练或放置 `models/student_cnn.pth`。")
+    elif model_backend.startswith("Student Dual"):
+        if STUDENT_DUAL_PATH.exists():
+            st.caption(f"Student Dual 权重已找到：`{STUDENT_DUAL_PATH}`")
+        else:
+            st.warning("未找到 Student Dual 权重。请先运行 `scripts/train_student_dual.py`。")
     if st.button("下载/检查 SimOPA 参考权重"):
         with st.spinner("准备 SimOPA 权重中..."):
             try:
@@ -448,7 +473,7 @@ with st.sidebar:
                     "权重下载失败。请检查网络后重试，或手动将 `SimOPA.pth` 放到 `models/` 目录。"
                 )
                 st.caption(str(exc))
-    st.info("本版本仅保留 SimOPA 评分主线。首次建议先点击一次“下载/检查权重”。")
+    st.info("可在此切换 SimOPA 与 Student CNN；首次建议先点击一次“下载/检查权重”。")
 
 bg_file = st.file_uploader(
     "上传背景图 (支持 jpg/jpeg/png/webp/bmp)",
@@ -497,6 +522,12 @@ resolution_profile = st.selectbox(
 )
 
 st.subheader("搜索策略")
+inference_mode = st.selectbox(
+    "推理策略",
+    options=["热力图引导搜索（默认）", "DenseMap加速（实验）"],
+    index=0,
+    help="DenseMap加速先做密集网格评分，再少量局部精修，通常更快。",
+)
 enable_scale_search = st.checkbox("启用多尺度搜索（推荐）", value=True)
 parallel_scale_search = st.checkbox(
     "并行执行多尺度搜索",
@@ -531,6 +562,11 @@ search_budget = st.slider(
          "这不是热力图采样点数量。",
 )
 precompute_heatmap = st.checkbox("推理时同步生成热力图（无需二次推理）", value=True)
+run_dual_backend_compare = st.checkbox(
+    "同时评测双后端（当前后端 + 原始SimOPA）",
+    value=False,
+    help="用于对比速度与分数分布，不改变主结果展示后端。",
+)
 heat_grid = st.slider(
     "热力图网格密度（每边采样点）",
     min_value=8,
@@ -782,72 +818,131 @@ if start_recommend:
                         elif item == "+20%":
                             scales.append(fg_scale * 1.2)
 
-                merged_rows = []
-                merged_images = []
-                scale_heatmaps = []
-                seen = set()
-                scorer = ReferenceOPAScorer(device="auto")
-                
                 scale_values = sorted(set(max(0.3, min(2.5, s)) for s in scales))
-                effective_compose_workers = (
-                    1 if parallel_scale_search and len(scale_values) > 1 else cpu_compose_workers
-                )
 
-                def search_one_scale(sc: float):
-                    fg_sc = resize_foreground(base_fg_rgba, sc * bg_resize_factor)
-                    fg_sc = fit_foreground_to_background(fg_sc, bg)
-                    return rank_candidates_heatmap_guided(
-                        bg,
-                        fg_sc,
-                        top_k=max(top_k, 6),
-                        candidate_count=search_budget,
-                        heatmap_grid=heat_grid,
-                        scale_tag=sc,
-                        scorer=scorer,
-                        compose_workers=effective_compose_workers,
+                def _run_backend(backend_name: str):
+                    merged_rows = []
+                    merged_images = []
+                    scale_heatmaps = []
+                    seen = set()
+                    scorer = create_opa_scorer(model_backend=backend_name, device="auto")
+                    parallel_enabled = bool(
+                        parallel_scale_search
+                        and len(scale_values) > 1
+                        and getattr(scorer.device, "type", "cpu") == "cpu"
                     )
+                    if parallel_scale_search and len(scale_values) > 1 and not parallel_enabled:
+                        st.caption(f"[{backend_name}] 检测到 GPU/MPS 推理，自动关闭多尺度线程并行。")
+                    effective_compose_workers = 1 if parallel_enabled else cpu_compose_workers
 
-                scale_results = []
-                if parallel_scale_search and len(scale_values) > 1:
-                    max_workers = min(4, len(scale_values))
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = {executor.submit(search_one_scale, sc): sc for sc in scale_values}
-                        for future in as_completed(futures):
-                            sc = futures[future]
-                            rows_sc, images_sc, hm_sc = future.result()
+                    def search_one_scale(sc: float):
+                        fg_sc = resize_foreground(base_fg_rgba, sc * bg_resize_factor)
+                        fg_sc = fit_foreground_to_background(fg_sc, bg)
+                        local_scorer = (
+                            create_opa_scorer(model_backend=backend_name, device=str(scorer.device))
+                            if parallel_enabled
+                            else scorer
+                        )
+                        if inference_mode.startswith("DenseMap"):
+                            return rank_candidates_dense_map(
+                                bg,
+                                fg_sc,
+                                top_k=max(top_k, 6),
+                                heatmap_grid=heat_grid,
+                                refine_per_point=6,
+                                scale_tag=sc,
+                                scorer=local_scorer,
+                                compose_workers=effective_compose_workers,
+                            )
+                        return rank_candidates_heatmap_guided(
+                            bg,
+                            fg_sc,
+                            top_k=max(top_k, 6),
+                            candidate_count=search_budget,
+                            heatmap_grid=heat_grid,
+                            scale_tag=sc,
+                            scorer=local_scorer,
+                            compose_workers=effective_compose_workers,
+                        )
+
+                    scale_results = []
+                    if parallel_enabled:
+                        max_workers = min(4, len(scale_values))
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            futures = {executor.submit(search_one_scale, sc): sc for sc in scale_values}
+                            for future in as_completed(futures):
+                                sc = futures[future]
+                                rows_sc, images_sc, hm_sc = future.result()
+                                scale_results.append((sc, rows_sc, images_sc, hm_sc))
+                        scale_results.sort(key=lambda item: item[0])
+                    else:
+                        for sc in scale_values:
+                            rows_sc, images_sc, hm_sc = search_one_scale(sc)
                             scale_results.append((sc, rows_sc, images_sc, hm_sc))
-                    scale_results.sort(key=lambda item: item[0])
-                else:
-                    for sc in scale_values:
-                        rows_sc, images_sc, hm_sc = search_one_scale(sc)
-                        scale_results.append((sc, rows_sc, images_sc, hm_sc))
 
-                for sc, rows_sc, images_sc, hm_sc in scale_results:
-                    for r, img in zip(rows_sc, images_sc):
-                        key = (int(r["x"]), int(r["y"]), round(float(r["scale"]), 2))
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        merged_rows.append(r)
-                        merged_images.append(img)
-                    fg_width = int(base_fg_rgba.size[0] * sc * bg_resize_factor)
-                    fg_height = int(base_fg_rgba.size[1] * sc * bg_resize_factor)
-                    scale_heatmaps.append((sc, hm_sc, fg_width, fg_height))
+                    for sc, rows_sc, images_sc, hm_sc in scale_results:
+                        for r, img in zip(rows_sc, images_sc):
+                            key = (int(r["x"]), int(r["y"]), round(float(r["scale"]), 2))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            merged_rows.append(r)
+                            merged_images.append(img)
+                        fg_width = int(base_fg_rgba.size[0] * sc * bg_resize_factor)
+                        fg_height = int(base_fg_rgba.size[1] * sc * bg_resize_factor)
+                        scale_heatmaps.append((sc, hm_sc, fg_width, fg_height))
 
-                merged = sorted(
-                    list(zip(merged_rows, merged_images)), key=lambda t: float(t[0]["score"]), reverse=True
-                )[:top_k]
-                ranked = [x[0] for x in merged]
-                images = [x[1] for x in merged]
-                hm = None
-                hm_overlay = None
-                if precompute_heatmap and scale_heatmaps:
-                    best_scale = float(ranked[0]["scale"]) if ranked else scale_heatmaps[0][0]
-                    chosen = min(scale_heatmaps, key=lambda t: abs(t[0] - best_scale))
-                    hm = chosen[1]
-                    hm_overlay = _draw_topk_markers(
-                        _render_heatmap_overlay(bg, hm), ranked, int(chosen[2]), int(chosen[3])
-                    )
+                    merged = sorted(
+                        list(zip(merged_rows, merged_images)), key=lambda t: float(t[0]["score"]), reverse=True
+                    )[:top_k]
+                    ranked = [x[0] for x in merged]
+                    images = [x[1] for x in merged]
+                    hm = None
+                    hm_overlay = None
+                    if precompute_heatmap and scale_heatmaps:
+                        best_scale = float(ranked[0]["scale"]) if ranked else scale_heatmaps[0][0]
+                        chosen = min(scale_heatmaps, key=lambda t: abs(t[0] - best_scale))
+                        hm = chosen[1]
+                        hm_overlay = _draw_topk_markers(
+                            _render_heatmap_overlay(bg, hm), ranked, int(chosen[2]), int(chosen[3])
+                        )
+                    return {
+                        "ranked": ranked,
+                        "images": images,
+                        "hm": hm,
+                        "hm_overlay": hm_overlay,
+                        "device": str(scorer.device),
+                        "parallel_enabled": bool(parallel_enabled),
+                        "effective_compose_workers": int(effective_compose_workers),
+                    }
+
+                primary = _run_backend(model_backend)
+                compare_report = []
+                if run_dual_backend_compare:
+                    compare_backends = [model_backend]
+                    if REFERENCE_BACKEND not in compare_backends:
+                        compare_backends.append(REFERENCE_BACKEND)
+                    for bname in compare_backends:
+                        t_cmp = time.time()
+                        out_cmp = primary if bname == model_backend else _run_backend(bname)
+                        cmp_latency = (time.time() - t_cmp) * 1000.0
+                        cmp_scores = [float(r["score"]) for r in out_cmp["ranked"]]
+                        compare_report.append(
+                            {
+                                "backend": bname,
+                                "latency_ms": float(cmp_latency),
+                                "top1_score": float(cmp_scores[0]) if cmp_scores else 0.0,
+                                "gap": float(max(cmp_scores) - min(cmp_scores)) if len(cmp_scores) >= 2 else 0.0,
+                            }
+                        )
+
+                ranked = primary["ranked"]
+                images = primary["images"]
+                hm = primary["hm"]
+                hm_overlay = primary["hm_overlay"]
+                device_used = primary["device"]
+                parallel_enabled = primary["parallel_enabled"]
+                effective_compose_workers = primary["effective_compose_workers"]
             except Exception as exc:
                 st.error(f"推理失败: {exc}")
                 st.stop()
@@ -862,10 +957,13 @@ if start_recommend:
             "latency_ms": latency_ms,
             "orig_bg_size": orig_bg_size,
             "resized_bg_size": resized_bg_size,
-            "device": str(scorer.device),
-            "parallel_scale_search": bool(parallel_scale_search and len(scale_values) > 1),
+            "device": device_used,
+            "model_backend": model_backend,
+            "inference_mode": inference_mode,
+            "parallel_scale_search": bool(parallel_enabled),
             "cpu_compose_workers": int(cpu_compose_workers),
             "effective_compose_workers": int(effective_compose_workers),
+            "compare_report": compare_report,
         }
         st.session_state["manual_score_result"] = None
         st.session_state["last_heatmap"] = hm
@@ -880,16 +978,24 @@ if "last_result" in st.session_state:
     images = res["images"]
     latency_ms = res["latency_ms"]
     device_used = res.get("device", "cpu")
+    model_backend_used = res.get("model_backend", REFERENCE_BACKEND)
+    inference_mode_used = res.get("inference_mode", "热力图引导搜索（默认）")
     parallel_used = res.get("parallel_scale_search", False)
     cpu_workers = res.get("cpu_compose_workers", 1)
     effective_workers = res.get("effective_compose_workers", cpu_workers)
+    compare_report = res.get("compare_report", [])
 
     st.success(f"完成。总耗时 {latency_ms:.1f} ms")
     st.caption(
+        f"后端模型：`{model_backend_used}`；"
+        f"推理策略：`{inference_mode_used}`；"
         f"推理设备：`{device_used}`（自动优先 GPU，不可用时回退 CPU）；"
         f"多尺度并行：{'开启' if parallel_used else '关闭'}；"
         f"CPU合成线程：{cpu_workers}（搜索实际使用 {effective_workers}）"
     )
+    if compare_report:
+        st.caption("双后端对比（一次运行）")
+        st.dataframe(compare_report, width="stretch")
     spread = spread_summary(ranked)
     st.caption(
         f"分数分布: min={spread['min']:.3f}, max={spread['max']:.3f}, "
@@ -976,26 +1082,71 @@ if "last_result" in st.session_state:
             st.session_state["manual_drag_x"] = manual_x
             st.session_state["manual_drag_y"] = manual_y
             st.session_state["manual_drag_canvas_key"] = f"manual_drag_canvas_image_{time.time_ns()}"
+            st.session_state["manual_drag_json"] = init_image
+            st.session_state["manual_drag_need_init"] = True
         if "manual_drag_canvas_key" not in st.session_state:
             st.session_state["manual_drag_canvas_key"] = f"manual_drag_canvas_image_{time.time_ns()}"
+        if "manual_drag_json" not in st.session_state:
+            st.session_state["manual_drag_json"] = init_image
+        if "manual_drag_need_init" not in st.session_state:
+            st.session_state["manual_drag_need_init"] = True
+
+        saved_drag_json = st.session_state.get("manual_drag_json")
+        saved_has_object = bool(
+            isinstance(saved_drag_json, dict)
+            and isinstance(saved_drag_json.get("objects"), list)
+            and len(saved_drag_json.get("objects", [])) > 0
+        )
+        if not saved_has_object:
+            saved_drag_json = init_image
+            st.session_state["manual_drag_json"] = init_image
+            st.session_state["manual_drag_need_init"] = True
+        # Canvas may return object JSON without `src` on some reruns; force-repair it
+        # so foreground image won't disappear after a transient rerender.
+        saved_obj = dict(saved_drag_json["objects"][0]) if saved_has_object else dict(init_image["objects"][0])
+        saved_obj["src"] = fg_data_url
+        saved_obj["width"] = float(fg_manual_drag.size[0])
+        saved_obj["height"] = float(fg_manual_drag.size[1])
+        saved_obj["lockRotation"] = True
+        saved_obj["lockScalingX"] = True
+        saved_obj["lockScalingY"] = True
+        saved_drag_json = {
+            "version": saved_drag_json.get("version", "4.4.0") if isinstance(saved_drag_json, dict) else "4.4.0",
+            "objects": [saved_obj],
+        }
+        st.session_state["manual_drag_json"] = saved_drag_json
+        inject_drawing = saved_drag_json if st.session_state.get("manual_drag_need_init", True) else None
 
         drag_canvas = st_canvas(
             fill_color="rgba(0,0,0,0)",
             stroke_width=1,
             stroke_color="#FFD400",
             background_image=bg,
-            update_streamlit=False,
+            update_streamlit=True,
             width=bg.size[0],
             height=bg.size[1],
             drawing_mode="transform",
-            # Always inject a valid foreground object with stable src to prevent
-            # the object from disappearing after reruns.
-            initial_drawing=init_image,
+            # Inject once when context changes/missing object; avoid per-rerun reset loops.
+            initial_drawing=inject_drawing,
             display_toolbar=False,
             key=st.session_state["manual_drag_canvas_key"],
         )
-        current_drag_json = drag_canvas.json_data
+        st.session_state["manual_drag_need_init"] = False
+        current_drag_json = drag_canvas.json_data or st.session_state.get("manual_drag_json")
         if current_drag_json is not None:
+            if isinstance(current_drag_json, dict) and isinstance(current_drag_json.get("objects"), list) and len(current_drag_json["objects"]) > 0:
+                first_obj = dict(current_drag_json["objects"][0])
+                first_obj["src"] = fg_data_url
+                first_obj["width"] = float(fg_manual_drag.size[0])
+                first_obj["height"] = float(fg_manual_drag.size[1])
+                first_obj["lockRotation"] = True
+                first_obj["lockScalingX"] = True
+                first_obj["lockScalingY"] = True
+                current_drag_json = {
+                    "version": current_drag_json.get("version", "4.4.0"),
+                    "objects": [first_obj],
+                }
+            st.session_state["manual_drag_json"] = current_drag_json
             manual_x_preview, manual_y_preview = _extract_image_xy_from_canvas(
                 json_data=current_drag_json,
                 default_x=manual_x,
@@ -1022,11 +1173,11 @@ if "last_result" in st.session_state:
             manual_submit = st.form_submit_button("计算推荐分数")
 
     if manual_submit:
-        scorer = ReferenceOPAScorer(device="auto")
+        scorer = create_opa_scorer(model_backend=model_backend_used, device="auto")
         fg_manual = resize_foreground(base_fg_rgba, manual_scale * manual_bg_resize_factor)
         fg_manual = fit_foreground_to_background(fg_manual, bg)
         if use_drag_manual:
-            current_drag_json = drag_canvas.json_data
+            current_drag_json = drag_canvas.json_data or st.session_state.get("manual_drag_json")
             manual_x, manual_y = _extract_image_xy_from_canvas(
                 json_data=current_drag_json,
                 default_x=int(st.session_state.get("manual_drag_x", manual_x)),
@@ -1036,6 +1187,8 @@ if "last_result" in st.session_state:
             )
             st.session_state["manual_drag_x"] = manual_x
             st.session_state["manual_drag_y"] = manual_y
+            if current_drag_json is not None:
+                st.session_state["manual_drag_json"] = current_drag_json
         manual = score_single_position(bg, fg_manual, manual_x, manual_y, scorer=scorer)
         tips = analyze_candidate(
             x=int(manual["x"]),
@@ -1050,6 +1203,7 @@ if "last_result" in st.session_state:
             "manual": manual,
             "tips": tips,
             "scale": float(manual_scale),
+            "backend": model_backend_used,
         }
 
     if st.session_state.get("manual_score_result") is not None:
@@ -1057,9 +1211,10 @@ if "last_result" in st.session_state:
         manual = cached["manual"]
         tips = cached["tips"]
         man_scale = float(cached.get("scale", 1.0))
+        man_backend = cached.get("backend", model_backend_used)
         st.success(
             f"当前位置分数={manual['score']:.3f}（{manual['level']}），"
-            f"x={manual['x']}, y={manual['y']}, scale={man_scale:.3f}"
+            f"x={manual['x']}, y={manual['y']}, scale={man_scale:.3f}，后端={man_backend}"
         )
         st.caption("；".join(tips))
 
@@ -1077,7 +1232,17 @@ if "last_result" in st.session_state:
 
     st.subheader("导出结果")
     json_bytes = json.dumps(
-        {"ranked": ranked, "latency_ms": float(latency_ms), "spread": spread}, ensure_ascii=False, indent=2
+        {
+            "model_backend": model_backend_used,
+            "inference_mode": inference_mode_used,
+            "device": device_used,
+            "ranked": ranked,
+            "latency_ms": float(latency_ms),
+            "spread": spread,
+            "compare_report": compare_report,
+        },
+        ensure_ascii=False,
+        indent=2,
     ).encode("utf-8")
     st.download_button(
         label="下载 ranking.json",
@@ -1090,6 +1255,9 @@ if "last_result" in st.session_state:
         images=images,
         heatmap_overlay_with_marks=st.session_state.get("last_heatmap_overlay"),
         raw_heatmap=st.session_state.get("last_heatmap"),
+        model_backend=model_backend_used,
+        device_used=device_used,
+        compare_report=compare_report,
     )
     st.download_button(
         label="下载结果包 (zip)",

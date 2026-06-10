@@ -7,3 +7,4 @@ MODEL_DIR.mkdir(exist_ok=True)
 
 SIMOPA_PATH = MODEL_DIR / "SimOPA.pth"
 STUDENT_CNN_PATH = MODEL_DIR / "student_cnn.pth"
+STUDENT_DUAL_PATH = MODEL_DIR / "student_dual_geom.pth"

@@ -12,27 +12,37 @@
 ## 3. 模型小改动（必须重点写）
 - 本体类改动 1：输入由 RGB 改为 `RGB+mask`（4 通道）。
 - 本体类改动 2：输出由二分类改为连续分数 `0~1`，并映射到三档标签。
-- 本体类改动 3（压缩）：Teacher（ResNet18）蒸馏到 Student（轻量 CNN）+ 剪枝 + 量化。
-- 功能类改动：多候选自动生成与排序返回 Top-K。
+- 本体类改动 3（轻量化）：Teacher（SimOPA）蒸馏到 Student CNN（MobileNetV3-Small 4ch），并增加 `KD + Feature + Rank` 蒸馏损失。
+- 本体类改动 4（原型）：Dual Encoder + Geometry MLP（Student Dual+Geom）。
+- 功能类改动：多候选自动生成与排序返回 Top-K；DenseMap 加速路径（实验）。
 
 ## 4. 可交互应用与推理链路
 - 入口：`streamlit run app.py`。
-- 数据流：上传图像 -> 候选生成 -> 逐候选推理 -> 排序 -> 可视化。
-- 本地推理证据：展示终端训练/压缩/推理日志与代码中的权重加载位置。
+- 数据流：上传图像 -> 候选/热力图评分 -> 排序 -> 可视化 -> 导出。
+- 前端展示：后端切换（SimOPA/Student/StudentDual）、双后端对比、推理策略切换。
+- 本地推理证据：展示终端训练/推理日志与代码中的权重加载位置。
 
 ## 5. 测试案例与结果
 - 至少展示 6 组候选位置对比。
 - 给出“效果较好”和“效果较差”的典型案例。
-- 记录推理时间和模型大小变化（压缩前后）。
+- 记录推理时间、参数量、分数分布（gap/std）、Spearman 排序相关。
+- 对比报告来源：`scripts/evaluate.py` 与 `scripts/batch_evaluate.py` 的 JSON/CSV。
 
-## 6. 失败案例与分析
+## 6. 训练工程与日志
+- 训练脚本：`scripts/train_student_cnn.py`、`scripts/train_student_dual.py`。
+- 加速配置：AMP、TF32、channels_last、可选 torch.compile、DataLoader prefetch/persistent。
+- 日志目录：`logs/<run_id>/config.json + metrics.csv + summary.json`。
+- 说明如何用日志判断：收敛速度、最佳 epoch、是否过拟合。
+
+## 7. 失败案例与分析
 - 边界越界、遮挡冲突、语义不合理时模型仍会误判。
 - 合成数据与真实数据分布差异会导致泛化下降。
+- DenseMap 模式下可能出现局部最优，需结合局部精修。
 
-## 7. AI 辅助说明
+## 8. AI 辅助说明
 - AI 参与部分：脚手架与基础代码生成、界面模板、文档草稿。
-- 人工接管部分：数据流核对、模型输入输出核实、压缩与评测脚本调试。
-- 关键问题定位：模块导入、压缩模型加载、评测一致性修复。
+- 人工接管部分：数据流核对、模型输入输出核实、蒸馏训练与评测脚本调试。
+- 关键问题定位：训练速度瓶颈、torch.compile/cudagraph冲突、拖拽状态同步问题。
 
-## 8. 分工与总结
+## 9. 分工与总结
 - 成员分工、完成度、后续优化计划（真实数据、移动端封装、模型解释）。

@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision
 import torchvision.transforms as transforms
 from PIL import Image
 
@@ -26,10 +27,6 @@ class ConvBNReLU(nn.Sequential):
 
 
 class SmallOPAConvBackbone(nn.Module):
-    """
-    Lightweight 4-channel CNN replacement for SimOPA's ResNet-18 backbone.
-    """
-
     def __init__(self) -> None:
         super().__init__()
         self.features = nn.Sequential(
@@ -47,29 +44,75 @@ class SmallOPAConvBackbone(nn.Module):
         return self.features(x)
 
 
-class SimOPAStudentCNN(nn.Module):
-    def __init__(self) -> None:
+class LegacySimOPAStudentCNN(nn.Module):
+    """
+    Old student architecture kept for loading legacy checkpoints.
+    """
+
+    def __init__(self, num_classes: int = 2) -> None:
         super().__init__()
         self.backbone = SmallOPAConvBackbone()
         self.avgpool1x1 = nn.AdaptiveAvgPool2d(1)
-        self.prediction_head = nn.Linear(512, 2, bias=False)
+        self.prediction_head = nn.Linear(512, num_classes, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feature_map = self.backbone(x)
-        global_feature = self.avgpool1x1(feature_map).flatten(1)
-        return self.prediction_head(global_feature)
+    def forward(self, x: torch.Tensor, return_features: bool = False):
+        fmap = self.backbone(x)
+        feat = self.avgpool1x1(fmap).flatten(1)
+        logits = self.prediction_head(feat)
+        if return_features:
+            return logits, feat
+        return logits
+
+
+class SimOPAStudentCNN(nn.Module):
+    """
+    MobileNetV3-Small student with 4-channel input (RGB+mask).
+    Kept class name for backward compatibility with existing scripts.
+    """
+
+    def __init__(self, num_classes: int = 2) -> None:
+        super().__init__()
+        net = torchvision.models.mobilenet_v3_small(weights=None)
+        first_conv = net.features[0][0]
+        net.features[0][0] = nn.Conv2d(
+            4,
+            first_conv.out_channels,
+            kernel_size=first_conv.kernel_size,
+            stride=first_conv.stride,
+            padding=first_conv.padding,
+            bias=False,
+        )
+        self.backbone = net.features
+        self.avgpool1x1 = nn.AdaptiveAvgPool2d(1)
+        feat_dim = 576
+        self.feature_proj = nn.Linear(feat_dim, 512, bias=False)
+        self.prediction_head = nn.Linear(512, num_classes, bias=False)
+
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+        fmap = self.backbone(x)
+        pooled = self.avgpool1x1(fmap).flatten(1)
+        return self.feature_proj(pooled)
+
+    def forward(self, x: torch.Tensor, return_features: bool = False):
+        feat = self.forward_features(x)
+        logits = self.prediction_head(feat)
+        if return_features:
+            return logits, feat
+        return logits
 
 
 def load_frozen_simopa_head(model: SimOPAStudentCNN, simopa_path: Path) -> None:
+    """
+    Legacy helper retained for compatibility.
+    If teacher head shape mismatches (expected for MobileNet student), keep
+    student head trainable and skip strict loading.
+    """
     state_dict = torch.load(simopa_path, map_location="cpu", weights_only=True)
-    model.prediction_head.load_state_dict(
-        {
-            "weight": state_dict["prediction_head.weight"],
-        },
-        strict=True,
-    )
-    for param in model.prediction_head.parameters():
-        param.requires_grad = False
+    teacher_w = state_dict.get("prediction_head.weight")
+    if teacher_w is not None and tuple(teacher_w.shape) == tuple(model.prediction_head.weight.shape):
+        model.prediction_head.load_state_dict({"weight": teacher_w}, strict=True)
+        for param in model.prediction_head.parameters():
+            param.requires_grad = False
 
 
 class StudentOPAScorer:
@@ -95,8 +138,35 @@ class StudentOPAScorer:
             )
 
         checkpoint = torch.load(self.weight_path, map_location="cpu", weights_only=True)
-        self.model = SimOPAStudentCNN().to(self.device).eval()
-        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+        def _normalize_state_dict(sd: dict) -> dict:
+            out = {}
+            for k, v in sd.items():
+                nk = k
+                if nk.startswith("_orig_mod."):
+                    nk = nk[len("_orig_mod.") :]
+                if nk.startswith("module."):
+                    nk = nk[len("module.") :]
+                out[nk] = v
+            return out
+
+        state_dict = _normalize_state_dict(state_dict)
+
+        def _looks_like_legacy(sd: dict) -> bool:
+            return any(k.startswith("backbone.features.") for k in sd.keys())
+
+        if _looks_like_legacy(state_dict):
+            self.model = LegacySimOPAStudentCNN().to(self.device).eval()
+            self.model.load_state_dict(state_dict, strict=True)
+        else:
+            self.model = SimOPAStudentCNN().to(self.device).eval()
+            try:
+                self.model.load_state_dict(state_dict, strict=True)
+            except RuntimeError:
+                # Final fallback for unexpected legacy naming.
+                self.model = LegacySimOPAStudentCNN().to(self.device).eval()
+                self.model.load_state_dict(state_dict, strict=True)
         self.temperature = max(0.1, float(score_temperature))
         image_size = int(checkpoint.get("image_size", 256))
         self.transformer = transforms.Compose(
