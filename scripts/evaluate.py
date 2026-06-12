@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.foreground import fit_foreground_to_background, resize_foreground
-from src.infer import rank_candidates
+from src.infer import rank_candidates, rank_candidates_dense_map, rank_candidates_heatmap_guided
 from src.opa import BACKENDS, create_opa_scorer
 from src.reference_opa import ensure_simopa_weight
 
@@ -53,6 +53,8 @@ def evaluate_pair(
     top_k: int,
     scale: float,
     model_backend: str,
+    search_mode: str,
+    heatmap_grid: int,
 ) -> dict:
     bg = Image.open(bg_path).convert("RGB")
     fg = Image.open(fg_path).convert("RGBA")
@@ -60,17 +62,38 @@ def evaluate_pair(
     scorer = create_opa_scorer(model_backend=model_backend, device="auto")
 
     t0 = time.time()
-    rows, _ = rank_candidates(
-        bg,
-        fg,
-        top_k=top_k,
-        candidate_count=candidate_count,
-        scale_tag=scale,
-        scorer=scorer,
-    )
+    if search_mode == "dense":
+        rows, _, _ = rank_candidates_dense_map(
+            bg,
+            fg,
+            top_k=top_k,
+            heatmap_grid=max(8, int(heatmap_grid)),
+            refine_per_point=6,
+            scale_tag=scale,
+            scorer=scorer,
+        )
+    elif search_mode == "legacy":
+        rows, _ = rank_candidates(
+            bg,
+            fg,
+            top_k=top_k,
+            candidate_count=candidate_count,
+            scale_tag=scale,
+            scorer=scorer,
+        )
+    else:
+        rows, _, _ = rank_candidates_heatmap_guided(
+            bg,
+            fg,
+            top_k=top_k,
+            candidate_count=candidate_count,
+            heatmap_grid=max(8, int(heatmap_grid)),
+            scale_tag=scale,
+            scorer=scorer,
+        )
     elapsed = (time.time() - t0) * 1000.0
     scores = np.array([float(r["score"]) for r in rows], dtype=np.float32)
-    # Pseudo-label by top half to support basic AUC sanity-check.
+    # Sanity-only metrics (not label-grounded quality metrics).
     y_true = np.zeros_like(scores, dtype=np.int64)
     y_true[np.argsort(scores)[len(scores) // 2 :]] = 1
     y_score = scores
@@ -83,7 +106,7 @@ def evaluate_pair(
     print(
         f"score min={scores.min():.4f} max={scores.max():.4f} gap={(scores.max()-scores.min()):.4f} std={scores.std():.4f}"
     )
-    print(f"pseudo_auc={auc:.4f} spearman_vs_rank={rho:.4f} params_m={params_m:.3f}")
+    print(f"sanity_auc={auc:.4f} sanity_spearman_vs_rank={rho:.4f} params_m={params_m:.3f}")
     for i, r in enumerate(rows):
         print(f"#{i+1} score={r['score']:.4f} level={r['level']} x={r['x']} y={r['y']} scale={r['scale']:.2f}")
     return {
@@ -94,8 +117,8 @@ def evaluate_pair(
         "score_max": float(scores.max()),
         "score_gap": float(scores.max() - scores.min()),
         "score_std": float(scores.std()),
-        "pseudo_auc": float(auc),
-        "spearman_vs_rank": float(rho),
+        "sanity_auc": float(auc),
+        "sanity_spearman_vs_rank": float(rho),
     }
 
 
@@ -106,13 +129,17 @@ if __name__ == "__main__":
     parser.add_argument("--candidate-count", type=int, default=16)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--scale", type=float, default=1.0)
-    parser.add_argument("--backend", default=BACKENDS[1], choices=BACKENDS)
-    parser.add_argument("--compare-both", action="store_true")
+    parser.add_argument("--backend", default=BACKENDS[0], choices=BACKENDS)
+    parser.add_argument("--search-mode", default="heatmap", choices=["heatmap", "dense", "legacy"])
+    parser.add_argument("--heatmap-grid", type=int, default=18)
+    parser.add_argument("--compare-both", action="store_true", help="legacy alias, compare all registered backends")
+    parser.add_argument("--compare-all", action="store_true", help="run all backends in one report")
     parser.add_argument("--out-json", default=None, help="optional output report json path")
     args = parser.parse_args()
 
     ensure_simopa_weight()
-    targets = BACKENDS if args.compare_both else [args.backend]
+    print("note: this script is for placement-search sanity. For label-grounded metrics, use scripts/evaluate_dataset_metrics.py")
+    targets = BACKENDS if (args.compare_both or args.compare_all) else [args.backend]
     report = []
     for backend in targets:
         report.append(
@@ -123,6 +150,8 @@ if __name__ == "__main__":
                 top_k=max(1, int(args.top_k)),
                 scale=max(0.3, min(2.5, float(args.scale))),
                 model_backend=backend,
+                search_mode=args.search_mode,
+                heatmap_grid=args.heatmap_grid,
             )
         )
     if args.out_json:

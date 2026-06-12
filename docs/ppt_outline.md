@@ -13,11 +13,12 @@
 - 轻量化蒸馏：Teacher SimOPA -> Student CNN（MobileNetV3-Small 4ch）
 - 蒸馏损失：CE + KD + Feature + Rank
 - 原型探索：Student Dual+Geom
+- 中型增强：Student Mid（ResNet18-4ch-width0.75, 约6.49M）
 
 ## 4. 结果展示
 - Top-K 推荐截图
 - 好案例 / 坏案例对比
-- 双后端对比（SimOPA vs Student）速度与分数分布
+- 四后端对比（SimOPA / Student CNN / Student Dual / Student Mid）速度与分数分布
 - DenseMap 加速策略效果
 
 ## 5. 现场可证明“真实模型推理”

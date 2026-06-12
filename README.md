@@ -6,6 +6,7 @@
 - `原始 SimOPA`
 - `Student CNN`（MobileNetV3-Small 4ch 蒸馏版）
 - `Student Dual+Geom (exp)`（实验原型）
+- `Student Mid (5-8M)`（ResNet18-4ch 宽度缩放版，精度优先）
 
 ## 核心能力
 
@@ -35,6 +36,7 @@ pip install -r requirements.txt
 - SimOPA 权重：`models/SimOPA.pth`
 - Student CNN 权重：`models/student_cnn.pth`
 - Student Dual 权重：`models/student_dual_geom.pth`
+- Student Mid 权重：`models/student_mid.pth`
 
 你可以在 App 侧边栏点击“下载/检查 SimOPA 参考权重”自动准备 SimOPA 权重。
 
@@ -47,7 +49,7 @@ streamlit run app.py
 ```
 
 建议流程：
-1. 在侧边栏选择后端模型（SimOPA / Student / Student Dual）。
+1. 在侧边栏选择后端模型（SimOPA / Student CNN / Student Dual / Student Mid）。
 2. 上传背景图与前景图（支持 `jpg/jpeg/png/webp/bmp`）。
 3. 选择前景处理（不抠图 / 一键抠图 / 手工抠图）。
 4. 选择搜索预算、热力图密度、推理策略（默认或 DenseMap）。
@@ -86,6 +88,18 @@ python scripts/train_student_dual.py --device cuda --epochs 20 --batch-size 128 
 
 日志结构与 Student CNN 一致。
 
+### 4.3 Student Mid (5-8M) 训练
+
+```bash
+python scripts/train_student_mid.py --device cuda --epochs 20 --batch-size 128 --num-workers 8 --channels-last
+```
+
+推荐首版参数（方案默认）：
+
+```bash
+--lr 2e-4 --temperature 2.5 --alpha-kd 0.5 --beta-feat 0.10 --gamma-rank 0.03 --distill-warmup-epochs 3 --freeze-head-epochs 2 --ema-decay 0.999
+```
+
 ---
 
 ## 5. 评测脚本
@@ -96,16 +110,16 @@ python scripts/train_student_dual.py --device cuda --epochs 20 --batch-size 128 
 python scripts/evaluate.py --bg path/to/bg.jpg --fg path/to/fg.png --backend 原始 SimOPA
 ```
 
-双后端对比：
+四后端对比：
 
 ```bash
-python scripts/evaluate.py --bg path/to/bg.jpg --fg path/to/fg.png --compare-both --out-json outputs/eval_report.json
+python scripts/evaluate.py --bg path/to/bg.jpg --fg path/to/fg.png --compare-all --out-json outputs/eval_report.json
 ```
 
 ### 批量评测
 
 ```bash
-python scripts/batch_evaluate.py --bg-dir data/bg --fg-dir data/fg --compare-both --out-csv outputs/batch_eval.csv
+python scripts/batch_evaluate.py --bg-dir data/bg --fg-dir data/fg --compare-all --out-csv outputs/batch_eval.csv
 ```
 
 ---
@@ -137,12 +151,14 @@ src/
   reference_opa.py
   student_opa.py
   student_opa_dual.py
+  student_opa_mid.py
   foreground.py
   compositor.py
   user_feedback.py
 scripts/
   train_student_cnn.py
   train_student_dual.py
+  train_student_mid.py
   evaluate.py
   batch_evaluate.py
 docs/

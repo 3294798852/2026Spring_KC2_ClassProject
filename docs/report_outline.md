@@ -14,12 +14,13 @@
 - 本体类改动 2：输出由二分类改为连续分数 `0~1`，并映射到三档标签。
 - 本体类改动 3（轻量化）：Teacher（SimOPA）蒸馏到 Student CNN（MobileNetV3-Small 4ch），并增加 `KD + Feature + Rank` 蒸馏损失。
 - 本体类改动 4（原型）：Dual Encoder + Geometry MLP（Student Dual+Geom）。
+- 本体类改动 5（中型增强）：`Student Mid (ResNet18-4ch-width0.75)`，参数量约 6.49M，在速度和精度间取得更平衡效果。
 - 功能类改动：多候选自动生成与排序返回 Top-K；DenseMap 加速路径（实验）。
 
 ## 4. 可交互应用与推理链路
 - 入口：`streamlit run app.py`。
 - 数据流：上传图像 -> 候选/热力图评分 -> 排序 -> 可视化 -> 导出。
-- 前端展示：后端切换（SimOPA/Student/StudentDual）、双后端对比、推理策略切换。
+- 前端展示：后端切换（SimOPA/Student CNN/Student Dual/Student Mid）、多后端对比、推理策略切换。
 - 本地推理证据：展示终端训练/推理日志与代码中的权重加载位置。
 
 ## 5. 测试案例与结果
@@ -29,7 +30,7 @@
 - 对比报告来源：`scripts/evaluate.py` 与 `scripts/batch_evaluate.py` 的 JSON/CSV。
 
 ## 6. 训练工程与日志
-- 训练脚本：`scripts/train_student_cnn.py`、`scripts/train_student_dual.py`。
+- 训练脚本：`scripts/train_student_cnn.py`、`scripts/train_student_dual.py`、`scripts/train_student_mid.py`。
 - 加速配置：AMP、TF32、channels_last、可选 torch.compile、DataLoader prefetch/persistent。
 - 日志目录：`logs/<run_id>/config.json + metrics.csv + summary.json`。
 - 说明如何用日志判断：收敛速度、最佳 epoch、是否过拟合。

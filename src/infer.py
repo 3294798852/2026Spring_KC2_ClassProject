@@ -6,6 +6,7 @@ import numpy as np
 from PIL import Image
 
 from src.compositor import Candidate, compose_rgba, generate_candidates, pil_to_rgb_np, pil_to_rgba_np
+from src.opa_protocol import OPAScorer
 from src.reference_opa import ReferenceOPAScorer
 from src.scoring import classify_score
 
@@ -40,6 +41,84 @@ def _compose_many(
         else:
             pairs = list(executor.map(compose_one, positions))
     return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _is_oom_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error" in msg and "memory" in msg
+
+
+class _SearchRuntime:
+    def __init__(
+        self,
+        bg: np.ndarray,
+        fg: np.ndarray,
+        scorer: OPAScorer,
+        compose_workers: int,
+        compose_executor: ThreadPoolExecutor | None,
+        max_x: int,
+        max_y: int,
+    ) -> None:
+        self.bg = bg
+        self.fg = fg
+        self.scorer = scorer
+        self.compose_workers = max(1, int(compose_workers))
+        self.compose_executor = compose_executor
+        self.max_x = int(max_x)
+        self.max_y = int(max_y)
+        self.score_cache: Dict[Tuple[int, int], float] = {}
+        dev_type = getattr(getattr(scorer, "device", None), "type", "cpu")
+        if dev_type == "cuda":
+            self.default_chunk_size = 24
+        elif dev_type == "mps":
+            self.default_chunk_size = 16
+        else:
+            self.default_chunk_size = max(6, self.compose_workers * 4)
+
+    def _score_chunk_safe(self, chunk: List[Tuple[int, int]]) -> None:
+        composites, masks = _compose_many(
+            self.bg,
+            self.fg,
+            chunk,
+            max_workers=self.compose_workers,
+            executor=self.compose_executor,
+        )
+        try:
+            new_scores = self.scorer.score_batch(composites, masks)
+        except RuntimeError as exc:
+            if len(chunk) <= 1 or not _is_oom_error(exc):
+                raise
+            mid = len(chunk) // 2
+            self._score_chunk_safe(chunk[:mid])
+            self._score_chunk_safe(chunk[mid:])
+            return
+        for pos, score in zip(chunk, new_scores):
+            self.score_cache[pos] = float(score)
+
+    def score_positions(self, positions: List[Tuple[int, int]], chunk_size: int | None = None) -> List[float]:
+        clipped = [_clip_position(x, y, self.max_x, self.max_y) for x, y in positions]
+        pending = [p for p in clipped if p not in self.score_cache]
+        if pending:
+            cs = self.default_chunk_size if chunk_size is None else max(1, int(chunk_size))
+            for chunk in _chunked(pending, cs):
+                self._score_chunk_safe(chunk)
+        return [self.score_cache[p] for p in clipped]
+
+
+def _write_refined_points_to_heatmap(
+    heatmap: np.ndarray,
+    points: List[Tuple[int, int]],
+    point_scores: List[float],
+    max_x: int,
+    max_y: int,
+) -> None:
+    if heatmap.size == 0 or not points:
+        return
+    h, w = heatmap.shape
+    for (x, y), s in zip(points, point_scores):
+        gx = int(round((float(x) / max(1, float(max_x))) * max(0, w - 1)))
+        gy = int(round((float(y) / max(1, float(max_y))) * max(0, h - 1)))
+        heatmap[gy, gx] = max(float(heatmap[gy, gx]), float(s))
 
 
 def _generate_seed_positions(
@@ -95,7 +174,7 @@ def rank_candidates(
     top_k: int = 5,
     candidate_count: int = 12,
     scale_tag: float = 1.0,
-    scorer: ReferenceOPAScorer | None = None,
+    scorer: OPAScorer | None = None,
     compose_workers: int = 1,
 ) -> Tuple[List[Dict], List[Image.Image]]:
     bg = pil_to_rgb_np(background)
@@ -105,35 +184,26 @@ def rank_candidates(
     max_x = max(0, bg_w - fg_w)
     max_y = max(0, bg_h - fg_h)
 
-    score_cache: Dict[Tuple[int, int], float] = {}
     simopa_scorer = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
     compose_workers = max(1, int(compose_workers))
-    score_chunk_size = max(6, compose_workers * 4)
     compose_executor = (
         ThreadPoolExecutor(max_workers=compose_workers) if compose_workers > 1 else None
     )
 
     try:
-        def score_positions(positions: List[Tuple[int, int]], chunk_size: int = score_chunk_size) -> List[float]:
-            clipped = [_clip_position(x, y, max_x, max_y) for x, y in positions]
-            pending = [p for p in clipped if p not in score_cache]
-            if pending:
-                for chunk in _chunked(pending, chunk_size):
-                    composites, masks = _compose_many(
-                        bg,
-                        fg,
-                        chunk,
-                        max_workers=compose_workers,
-                        executor=compose_executor,
-                    )
-                    new_scores = simopa_scorer.score_batch(composites, masks)
-                    for pos, score in zip(chunk, new_scores):
-                        score_cache[pos] = float(score)
-            return [score_cache[p] for p in clipped]
+        runtime = _SearchRuntime(
+            bg=bg,
+            fg=fg,
+            scorer=simopa_scorer,
+            compose_workers=compose_workers,
+            compose_executor=compose_executor,
+            max_x=max_x,
+            max_y=max_y,
+        )
 
         # Stage 1: broad search.
         seed_positions = _generate_seed_positions(bg_w, bg_h, fg_w, fg_h, candidate_count)
-        seed_scores = score_positions(seed_positions)
+        seed_scores = runtime.score_positions(seed_positions)
         ranked_seed = sorted(zip(seed_positions, seed_scores), key=lambda t: t[1], reverse=True)
 
         # Stage 2: local pattern search around elites.
@@ -143,7 +213,7 @@ def rank_candidates(
         init_step = max(6, min(bg_w, bg_h) // 10)
         for start in elite_positions:
             cur_x, cur_y = start
-            cur_score = score_positions([(cur_x, cur_y)])[0]
+            cur_score = runtime.score_positions([(cur_x, cur_y)])[0]
             step = init_step
             while step >= 2:
                 neighbors = [
@@ -157,7 +227,7 @@ def rank_candidates(
                     (cur_x - step, cur_y - step),
                 ]
                 neighbors = [_clip_position(x, y, max_x, max_y) for x, y in neighbors]
-                neigh_scores = score_positions(neighbors)
+                neigh_scores = runtime.score_positions(neighbors)
                 best_idx = int(np.argmax(neigh_scores))
                 if neigh_scores[best_idx] > cur_score + 1e-6:
                     cur_x, cur_y = neighbors[best_idx]
@@ -167,7 +237,7 @@ def rank_candidates(
             refined_positions.append((cur_x, cur_y))
 
         all_positions = seed_positions + refined_positions
-        all_scores = score_positions(all_positions)
+        all_scores = runtime.score_positions(all_positions)
 
         rows: List[Candidate] = []
         seen = set()
@@ -200,7 +270,7 @@ def score_single_position(
     foreground: Image.Image,
     x: int,
     y: int,
-    scorer: ReferenceOPAScorer | None = None,
+    scorer: OPAScorer | None = None,
 ) -> Dict:
     bg = pil_to_rgb_np(background)
     fg = pil_to_rgba_np(foreground)
@@ -226,7 +296,7 @@ def score_heatmap(
     background: Image.Image,
     foreground: Image.Image,
     grid_size: int = 14,
-    scorer: ReferenceOPAScorer | None = None,
+    scorer: OPAScorer | None = None,
 ) -> np.ndarray:
     bg = pil_to_rgb_np(background)
     fg = pil_to_rgba_np(foreground)
@@ -261,7 +331,7 @@ def rank_candidates_heatmap_guided(
     candidate_count: int = 48,
     heatmap_grid: int = 18,
     scale_tag: float = 1.0,
-    scorer: ReferenceOPAScorer | None = None,
+    scorer: OPAScorer | None = None,
     compose_workers: int = 1,
 ) -> Tuple[List[Dict], List[Image.Image], np.ndarray]:
     """
@@ -280,36 +350,27 @@ def rank_candidates_heatmap_guided(
     heatmap_grid = max(6, int(heatmap_grid))
     candidate_count = max(12, int(candidate_count))
 
-    score_cache: Dict[Tuple[int, int], float] = {}
     simopa_scorer = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
     compose_workers = max(1, int(compose_workers))
-    score_chunk_size = max(6, compose_workers * 4)
     compose_executor = (
         ThreadPoolExecutor(max_workers=compose_workers) if compose_workers > 1 else None
     )
 
     try:
-        def score_positions(positions: List[Tuple[int, int]], chunk_size: int = score_chunk_size) -> List[float]:
-            clipped = [_clip_position(x, y, max_x, max_y) for x, y in positions]
-            pending = [p for p in clipped if p not in score_cache]
-            if pending:
-                for chunk in _chunked(pending, chunk_size):
-                    composites, masks = _compose_many(
-                        bg,
-                        fg,
-                        chunk,
-                        max_workers=compose_workers,
-                        executor=compose_executor,
-                    )
-                    new_scores = simopa_scorer.score_batch(composites, masks)
-                    for pos, score in zip(chunk, new_scores):
-                        score_cache[pos] = float(score)
-            return [score_cache[p] for p in clipped]
+        runtime = _SearchRuntime(
+            bg=bg,
+            fg=fg,
+            scorer=simopa_scorer,
+            compose_workers=compose_workers,
+            compose_executor=compose_executor,
+            max_x=max_x,
+            max_y=max_y,
+        )
 
         xs = np.linspace(0, max_x, num=heatmap_grid, dtype=int)
         ys = np.linspace(0, max_y, num=heatmap_grid, dtype=int)
         grid_positions = [(int(x), int(y)) for y in ys for x in xs]
-        grid_scores = score_positions(grid_positions, chunk_size=6)
+        grid_scores = runtime.score_positions(grid_positions, chunk_size=6)
         heatmap = np.array(grid_scores, dtype=np.float32).reshape(heatmap_grid, heatmap_grid)
         ranked_grid = sorted(zip(grid_positions, grid_scores), key=lambda t: t[1], reverse=True)
 
@@ -322,7 +383,7 @@ def rank_candidates_heatmap_guided(
         refined_positions: List[Tuple[int, int]] = []
         for start in elite_positions:
             cur_x, cur_y = start
-            cur_score = score_positions([(cur_x, cur_y)])[0]
+            cur_score = runtime.score_positions([(cur_x, cur_y)])[0]
             step = init_step
             while step >= 2:
                 neighbors = [
@@ -336,7 +397,7 @@ def rank_candidates_heatmap_guided(
                     (cur_x - step, cur_y - step),
                 ]
                 neighbors = [_clip_position(x, y, max_x, max_y) for x, y in neighbors]
-                neigh_scores = score_positions(neighbors)
+                neigh_scores = runtime.score_positions(neighbors)
                 best_idx = int(np.argmax(neigh_scores))
                 if neigh_scores[best_idx] > cur_score + 1e-6:
                     cur_x, cur_y = neighbors[best_idx]
@@ -348,7 +409,14 @@ def rank_candidates_heatmap_guided(
         all_positions = grid_positions + refined_positions
         if len(all_positions) < candidate_count:
             all_positions.extend(_generate_seed_positions(bg_w, bg_h, fg_w, fg_h, candidate_count))
-        all_scores = score_positions(all_positions, chunk_size=6)
+        all_scores = runtime.score_positions(all_positions, chunk_size=6)
+        _write_refined_points_to_heatmap(
+            heatmap=heatmap,
+            points=all_positions,
+            point_scores=all_scores,
+            max_x=max_x,
+            max_y=max_y,
+        )
 
         rows: List[Candidate] = []
         seen = set()
@@ -382,7 +450,7 @@ def rank_candidates_dense_map(
     heatmap_grid: int = 24,
     refine_per_point: int = 4,
     scale_tag: float = 1.0,
-    scorer: ReferenceOPAScorer | None = None,
+    scorer: OPAScorer | None = None,
     compose_workers: int = 1,
 ) -> Tuple[List[Dict], List[Image.Image], np.ndarray]:
     """
@@ -402,31 +470,23 @@ def rank_candidates_dense_map(
     compose_workers = max(1, int(compose_workers))
 
     sc = scorer if scorer is not None else ReferenceOPAScorer(device="cpu")
-    score_cache: Dict[Tuple[int, int], float] = {}
     compose_executor = ThreadPoolExecutor(max_workers=compose_workers) if compose_workers > 1 else None
 
     try:
-        def score_positions(positions: List[Tuple[int, int]], chunk_size: int = max(6, compose_workers * 4)) -> List[float]:
-            clipped = [_clip_position(x, y, max_x, max_y) for x, y in positions]
-            pending = [p for p in clipped if p not in score_cache]
-            if pending:
-                for chunk in _chunked(pending, chunk_size):
-                    composites, masks = _compose_many(
-                        bg,
-                        fg,
-                        chunk,
-                        max_workers=compose_workers,
-                        executor=compose_executor,
-                    )
-                    new_scores = sc.score_batch(composites, masks)
-                    for pos, score in zip(chunk, new_scores):
-                        score_cache[pos] = float(score)
-            return [score_cache[p] for p in clipped]
+        runtime = _SearchRuntime(
+            bg=bg,
+            fg=fg,
+            scorer=sc,
+            compose_workers=compose_workers,
+            compose_executor=compose_executor,
+            max_x=max_x,
+            max_y=max_y,
+        )
 
         xs = np.linspace(0, max_x, num=heatmap_grid, dtype=int)
         ys = np.linspace(0, max_y, num=heatmap_grid, dtype=int)
         grid_positions = [(int(x), int(y)) for y in ys for x in xs]
-        grid_scores = score_positions(grid_positions)
+        grid_scores = runtime.score_positions(grid_positions)
         heatmap = np.array(grid_scores, dtype=np.float32).reshape(heatmap_grid, heatmap_grid)
         ranked_grid = sorted(zip(grid_positions, grid_scores), key=lambda t: t[1], reverse=True)
 
@@ -461,7 +521,14 @@ def rank_candidates_dense_map(
             refine_positions.extend(cand)
 
         all_positions = grid_positions + refine_positions
-        all_scores = score_positions(all_positions)
+        all_scores = runtime.score_positions(all_positions)
+        _write_refined_points_to_heatmap(
+            heatmap=heatmap,
+            points=all_positions,
+            point_scores=all_scores,
+            max_x=max_x,
+            max_y=max_y,
+        )
         rows: List[Candidate] = []
         seen = set()
         for (x, y), score in sorted(zip(all_positions, all_scores), key=lambda t: t[1], reverse=True):

@@ -1,14 +1,17 @@
 import torch
 
+from src.opa_protocol import OPAScorer
 from src.reference_opa import ReferenceOPAScorer
 from src.student_opa import StudentOPAScorer
 from src.student_opa_dual import StudentDualOPAScorer
+from src.student_opa_mid import StudentMidOPAScorer
 
 
 STUDENT_BACKEND = "Student CNN"
 STUDENT_DUAL_BACKEND = "Student Dual+Geom (exp)"
+STUDENT_MID_BACKEND = "Student Mid (5-8M)"
 REFERENCE_BACKEND = "原始 SimOPA"
-BACKENDS = [STUDENT_BACKEND, STUDENT_DUAL_BACKEND, REFERENCE_BACKEND]
+BACKENDS = [STUDENT_BACKEND, STUDENT_DUAL_BACKEND, STUDENT_MID_BACKEND, REFERENCE_BACKEND]
 
 
 def select_opa_device(device: str = "auto") -> torch.device:
@@ -21,7 +24,7 @@ def select_opa_device(device: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
-def create_opa_scorer(model_backend: str, device: str = "auto"):
+def create_opa_scorer(model_backend: str, device: str = "auto") -> OPAScorer:
     selected_device = select_opa_device(device)
     if model_backend == REFERENCE_BACKEND:
         return ReferenceOPAScorer(device=str(selected_device))
@@ -29,4 +32,6 @@ def create_opa_scorer(model_backend: str, device: str = "auto"):
         return StudentOPAScorer(device=str(selected_device))
     if model_backend == STUDENT_DUAL_BACKEND:
         return StudentDualOPAScorer(device=str(selected_device))
+    if model_backend == STUDENT_MID_BACKEND:
+        return StudentMidOPAScorer(device=str(selected_device))
     raise ValueError(f"unknown OPA backend: {model_backend}")

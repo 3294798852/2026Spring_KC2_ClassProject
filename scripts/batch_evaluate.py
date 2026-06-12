@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.foreground import fit_foreground_to_background, resize_foreground
-from src.infer import rank_candidates
+from src.infer import rank_candidates, rank_candidates_dense_map, rank_candidates_heatmap_guided
 from src.opa import BACKENDS, create_opa_scorer
 from src.reference_opa import ensure_simopa_weight
 
@@ -32,8 +32,12 @@ def main():
     parser.add_argument("--candidate-count", type=int, default=16)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--scale", type=float, default=1.0)
-    parser.add_argument("--backend", default=BACKENDS[1], choices=BACKENDS)
-    parser.add_argument("--compare-both", action="store_true")
+    parser.add_argument("--backend", default=BACKENDS[0], choices=BACKENDS)
+    parser.add_argument("--search-mode", default="heatmap", choices=["heatmap", "dense", "legacy"])
+    parser.add_argument("--heatmap-grid", type=int, default=18)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--compare-both", action="store_true", help="legacy alias, compare all registered backends")
+    parser.add_argument("--compare-all", action="store_true", help="run all backends in one report")
     args = parser.parse_args()
 
     bg_dir = Path(args.bg_dir)
@@ -46,23 +50,44 @@ def main():
         raise RuntimeError("no paired samples found. ensure bg/fg filenames share same stem.")
 
     rows = []
-    backends = BACKENDS if args.compare_both else [args.backend]
+    backends = BACKENDS if (args.compare_both or args.compare_all) else [args.backend]
     for backend in backends:
-        scorer = create_opa_scorer(model_backend=backend, device="cpu")
+        scorer = create_opa_scorer(model_backend=backend, device=args.device)
         params_m = sum(p.numel() for p in scorer.model.parameters()) / 1e6 if hasattr(scorer, "model") else 0.0
         for stem, bg_path, fg_path in pairs:
             bg = Image.open(bg_path).convert("RGB")
             fg = Image.open(fg_path).convert("RGBA")
             fg = fit_foreground_to_background(resize_foreground(fg, args.scale), bg)
             t0 = time.time()
-            ranked, _ = rank_candidates(
-                bg,
-                fg,
-                top_k=max(1, args.top_k),
-                candidate_count=max(6, args.candidate_count),
-                scale_tag=args.scale,
-                scorer=scorer,
-            )
+            if args.search_mode == "dense":
+                ranked, _, _ = rank_candidates_dense_map(
+                    bg,
+                    fg,
+                    top_k=max(1, args.top_k),
+                    heatmap_grid=max(8, int(args.heatmap_grid)),
+                    refine_per_point=6,
+                    scale_tag=args.scale,
+                    scorer=scorer,
+                )
+            elif args.search_mode == "legacy":
+                ranked, _ = rank_candidates(
+                    bg,
+                    fg,
+                    top_k=max(1, args.top_k),
+                    candidate_count=max(6, args.candidate_count),
+                    scale_tag=args.scale,
+                    scorer=scorer,
+                )
+            else:
+                ranked, _, _ = rank_candidates_heatmap_guided(
+                    bg,
+                    fg,
+                    top_k=max(1, args.top_k),
+                    candidate_count=max(6, args.candidate_count),
+                    heatmap_grid=max(8, int(args.heatmap_grid)),
+                    scale_tag=args.scale,
+                    scorer=scorer,
+                )
             latency_ms = (time.time() - t0) * 1000.0
             scores = np.array([float(r["score"]) for r in ranked], dtype=np.float32)
             rows.append(

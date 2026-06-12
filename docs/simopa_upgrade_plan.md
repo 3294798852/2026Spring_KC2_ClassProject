@@ -2,7 +2,7 @@
 
 ## 1. 目标
 - 将项目主线统一到 `SimOPA` 评分范式（4ch：RGB+mask）。
-- 在保证质量的前提下推进轻量化：`SimOPA -> Student CNN -> Student Dual+Geom`。
+- 在保证质量的前提下推进轻量化：`SimOPA -> Student CNN -> Student Dual+Geom -> Student Mid (5-8M)`。
 - 提升端到端速度：搜索策略升级为“热力图引导 + DenseMap加速（实验）”。
 - 完善工程可复现性：训练日志、评测报告、UI双后端对比。
 
@@ -17,6 +17,11 @@
 - 问题：早期轻量 CNN 精度下降明显。
 - 方案：Student CNN 升级为 MobileNetV3-Small 4ch，并采用 `CE + KD + Feature + Rank` 蒸馏训练。
 - 验收：在统一评测脚本下，学生模型速度提升且精度差距可控。
+
+### P0.5 中型学生模型精度补强（5-8M）
+- 问题：超轻量模型速度优势明显，但与 SimOPA 仍存在质量差距。
+- 方案：新增 `Student Mid (ResNet18-4ch-width0.75)`，参数量约 6.49M，训练采用 `CE + KD + Feature + Rank`，并加入分段解冻和 EMA 评估稳定训练后期波动。
+- 验收：在 `evaluate.py/batch_evaluate.py --compare-all` 下，`Student Mid` 的质量指标（val_acc/Spearman）显著优于 `Student CNN`，且时延仍优于原始 SimOPA。
 
 ### P1. 评测闭环不完整
 - 问题：缺少统一的“质量 + 速度 + 参数量”横向对比。
@@ -36,11 +41,12 @@
 ## 3. 实施顺序
 1. 训练加速与日志化  
 2. Student CNN 蒸馏升级  
-3. 评测脚本闭环（单后端/双后端）  
+3. 评测脚本闭环（单后端/四后端对比）  
 4. UI 展示与导出同步  
 5. Student Dual+Geom 原型  
-6. DenseMap 加速路径  
-7. README/docs 同步
+6. Student Mid (5-8M) 接入与训练脚本  
+7. DenseMap 加速路径  
+8. README/docs 同步
 
 ## 4. 后续增强（v3）
 - 增加训练自动 benchmark 模式（自动搜索 batch-size / num-workers）。
